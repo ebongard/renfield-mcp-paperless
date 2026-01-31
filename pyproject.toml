@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renfield-mcp-paperless"
+version = "1.0.0"
+description = "MCP server for Paperless-NGX document search with compact responses."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.26.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+renfield-mcp-paperless = "renfield_mcp_paperless.server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[tool.setuptools.packages.find]
+include = ["renfield_mcp_paperless*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

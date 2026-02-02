@@ -43,6 +43,7 @@ class TestResolveDocument:
         result = paperless._resolve_document({
             "id": 1,
             "title": "COMPANY 1 Rechnung 2030-01",
+            "created": "2030-01-15",
             "correspondent": 1,
             "document_type": 2,
             "storage_path": 3,
@@ -51,6 +52,7 @@ class TestResolveDocument:
         assert result == {
             "id": 1,
             "title": "COMPANY 1 Rechnung 2030-01",
+            "created": "2030-01-15",
             "correspondent": "COMPANY 1",
             "document_type": "Rechnung",
             "storage_path": "rechnungen/company1",
@@ -62,13 +64,14 @@ class TestResolveDocument:
         paperless._storage_path_cache = {}
 
         result = paperless._resolve_document({
-            "id": 1, "title": "Test",
+            "id": 1, "title": "Test", "created": None,
             "correspondent": None, "document_type": None, "storage_path": None,
         })
 
         assert result["correspondent"] is None
         assert result["document_type"] is None
         assert result["storage_path"] is None
+        assert result["created"] is None
 
     def test_unknown_id_returns_none(self):
         paperless._correspondent_cache = {1: "Known"}
@@ -76,7 +79,7 @@ class TestResolveDocument:
         paperless._storage_path_cache = {}
 
         result = paperless._resolve_document({
-            "id": 1, "title": "Test",
+            "id": 1, "title": "Test", "created": "2030-06-01",
             "correspondent": 999, "document_type": None, "storage_path": None,
         })
 
@@ -205,6 +208,192 @@ class TestSearchDocuments:
 # ── Response Size ────────────────────────────────────────────────
 
 
+class TestSearchDocumentsOrdering:
+    @pytest.mark.asyncio
+    async def test_default_ordering_is_newest_first(self):
+        """Default ordering sends -created to the API."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents("test")
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert params["ordering"] == "-created"
+
+    @pytest.mark.asyncio
+    async def test_custom_ordering_forwarded(self):
+        """Custom ordering parameter is forwarded to API."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents("test", ordering="title")
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert params["ordering"] == "title"
+
+    @pytest.mark.asyncio
+    async def test_created_field_in_results(self):
+        """Results include the created date field."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "count": 1,
+            "next": None,
+            "results": [
+                {"id": 1, "title": "Invoice", "created": "2030-06-15",
+                 "correspondent": None, "document_type": None, "storage_path": None},
+            ],
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.search_documents("Invoice")
+
+        assert result["results"][0]["created"] == "2030-06-15"
+
+
+# ── download_document ───────────────────────────────────────────
+
+
+class TestDownloadDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.download_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.download_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_download(self):
+        pdf_bytes = b"%PDF-1.4 fake content"
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = pdf_bytes
+        mock_resp.headers = {
+            "content-disposition": 'attachment; filename="invoice_2030.pdf"',
+            "content-type": "application/pdf",
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.download_document(42)
+
+        assert result["id"] == 42
+        assert result["filename"] == "invoice_2030.pdf"
+        assert result["mime_type"] == "application/pdf"
+        import base64
+        assert base64.b64decode(result["content_base64"]) == pdf_bytes
+
+    @pytest.mark.asyncio
+    async def test_document_not_found(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.download_document(9999)
+
+        assert "error" in result
+        assert "9999" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_filename_without_content_disposition(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"data"
+        mock_resp.headers = {"content-type": "application/pdf"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.download_document(7)
+
+        assert result["filename"] == "document_7.pdf"
+
+    @pytest.mark.asyncio
+    async def test_content_disposition_without_quotes(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"data"
+        mock_resp.headers = {
+            "content-disposition": "attachment; filename=report.pdf",
+            "content-type": "application/pdf",
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.download_document(5)
+
+        assert result["filename"] == "report.pdf"
+
+
+# ── Response Size ────────────────────────────────────────────────
+
+
 class TestResponseSize:
     def test_25_results_under_10kb(self):
         """25 results with resolved names must fit under 10KB."""
@@ -213,6 +402,7 @@ class TestResponseSize:
             results.append({
                 "id": 1700 + i,
                 "title": f"2030_{i:02d}_02 RE COMPANY 1 IN_10015{i}23473",
+                "created": "2030-01-15",
                 "correspondent": "COMPANY 1",
                 "document_type": "Rechnung",
                 "storage_path": "rechnungen/company1/2030",

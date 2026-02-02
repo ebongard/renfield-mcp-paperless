@@ -10,8 +10,10 @@ Environment variables:
     PAPERLESS_API_TOKEN  — API authentication token
 """
 
+import base64
 import logging
 import os
+import re
 import sys
 from typing import Optional
 
@@ -89,6 +91,7 @@ def _resolve_document(doc: dict) -> dict:
     return {
         "id": doc["id"],
         "title": doc.get("title", ""),
+        "created": doc.get("created"),
         "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "storage_path": (_storage_path_cache or {}).get(spath_id) if spath_id else None,
@@ -104,16 +107,19 @@ async def search_documents(
     query: str,
     page: int = 1,
     page_size: int = 25,
+    ordering: str = "-created",
 ) -> dict:
     """Search documents in Paperless-NGX by full-text query.
 
-    Returns a compact list with id, title, correspondent, document_type,
-    and storage_path (names resolved from IDs).
+    Returns a compact list with id, title, created date, correspondent,
+    document_type, and storage_path (names resolved from IDs).
+    Results are sorted by date (newest first) by default.
 
     Args:
         query: Full-text search query
         page: Page number (default: 1)
         page_size: Results per page (default: 25, max: 100)
+        ordering: Sort order (default: "-created" for newest first)
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -131,7 +137,8 @@ async def search_documents(
                 "query": query,
                 "page": page,
                 "page_size": page_size,
-                "fields": "id,title,correspondent,document_type,storage_path",
+                "ordering": ordering,
+                "fields": "id,title,created,correspondent,document_type,storage_path",
             },
             headers=_headers(),
         )
@@ -145,6 +152,48 @@ async def search_documents(
         "page": page,
         "page_size": page_size,
         "results": results,
+    }
+
+
+@mcp.tool()
+async def download_document(document_id: int) -> dict:
+    """Download a document from Paperless-NGX by ID.
+
+    Returns the file as base64-encoded content with filename and MIME type.
+    Use the document IDs from search_documents results.
+
+    Args:
+        document_id: Paperless document ID
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{PAPERLESS_API_URL}/api/documents/{document_id}/download/",
+            headers=_headers(),
+        )
+        if resp.status_code == 404:
+            return {"error": f"Document {document_id} not found"}
+        resp.raise_for_status()
+
+    # Extract filename from Content-Disposition header
+    filename = f"document_{document_id}.pdf"
+    cd = resp.headers.get("content-disposition", "")
+    match = re.search(r'filename="?([^";\n]+)"?', cd)
+    if match:
+        filename = match.group(1).strip()
+
+    mime_type = resp.headers.get("content-type", "application/pdf").split(";")[0].strip()
+    content_b64 = base64.b64encode(resp.content).decode("ascii")
+
+    return {
+        "id": document_id,
+        "filename": filename,
+        "mime_type": mime_type,
+        "content_base64": content_b64,
     }
 
 

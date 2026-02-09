@@ -197,6 +197,66 @@ async def download_document(document_id: int) -> dict:
     }
 
 
+@mcp.tool()
+async def upload_document(
+    title: str,
+    file_content_base64: str,
+    filename: str = "document.pdf",
+    correspondent: str | None = None,
+    document_type: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Upload a document to Paperless-NGX for OCR and archiving.
+
+    Accepts a base64-encoded file and submits it to Paperless for processing.
+    Returns a task ID that can be used to track the import status.
+
+    Args:
+        title: Document title
+        file_content_base64: Base64-encoded file content
+        filename: Original filename (default: document.pdf)
+        correspondent: Optional correspondent name
+        document_type: Optional document type name
+        tags: Optional list of tag names
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    try:
+        file_bytes = base64.b64decode(file_content_base64)
+    except Exception:
+        return {"error": "Invalid base64 content"}
+
+    data: dict[str, str] = {"title": title}
+    if correspondent:
+        data["correspondent"] = correspondent
+    if document_type:
+        data["document_type"] = document_type
+    if tags:
+        for i, tag in enumerate(tags):
+            data[f"tags[{i}]"] = tag
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/documents/post_document/",
+            headers=_headers(),
+            files={"document": (filename, file_bytes)},
+            data=data,
+        )
+        resp.raise_for_status()
+
+    # Paperless returns the task ID as plain text
+    task_id = resp.text.strip().strip('"')
+
+    return {
+        "task_id": task_id,
+        "title": title,
+        "filename": filename,
+    }
+
+
 def main():
     """Entry point for console script and python -m."""
     mcp.run(transport="stdio")

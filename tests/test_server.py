@@ -394,6 +394,66 @@ class TestDownloadDocument:
 # ── Response Size ────────────────────────────────────────────────
 
 
+# ── upload_document ─────────────────────────────────────────────
+
+
+class TestUploadDocument:
+    @pytest.mark.asyncio
+    async def test_upload_success(self):
+        import base64
+        file_bytes = b"%PDF-1.4 test content"
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '"task-uuid-123"'
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.upload_document(
+                title="Test Invoice",
+                file_content_base64=b64,
+                filename="invoice.pdf",
+            )
+
+        assert result["task_id"] == "task-uuid-123"
+        assert result["title"] == "Test Invoice"
+        assert result["filename"] == "invoice.pdf"
+
+    @pytest.mark.asyncio
+    async def test_upload_missing_url(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.upload_document(
+            title="Test", file_content_base64="dGVzdA=="
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_upload_missing_token(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.upload_document(
+            title="Test", file_content_base64="dGVzdA=="
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_upload_invalid_base64(self):
+        result = await paperless.upload_document(
+            title="Test", file_content_base64="not-valid-base64!!!"
+        )
+        assert "error" in result
+
+
+# ── Response Size ────────────────────────────────────────────────
+
+
 class TestResponseSize:
     def test_25_results_under_10kb(self):
         """25 results with resolved names must fit under 10KB."""

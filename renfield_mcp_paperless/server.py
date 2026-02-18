@@ -108,6 +108,8 @@ async def search_documents(
     page: int = 1,
     page_size: int = 25,
     ordering: str = "-created",
+    created_after: str | None = None,
+    created_before: str | None = None,
 ) -> dict:
     """Search documents in Paperless-NGX by full-text query.
 
@@ -120,6 +122,8 @@ async def search_documents(
         page: Page number (default: 1)
         page_size: Results per page (default: 25, max: 100)
         ordering: Sort order (default: "-created" for newest first)
+        created_after: Only documents created on or after this date (YYYY-MM-DD)
+        created_before: Only documents created on or before this date (YYYY-MM-DD)
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -131,15 +135,21 @@ async def search_documents(
     async with httpx.AsyncClient(timeout=15.0) as client:
         await _ensure_caches(client)
 
+        params = {
+            "query": query,
+            "page": page,
+            "page_size": page_size,
+            "ordering": ordering,
+            "fields": "id,title,created,correspondent,document_type,storage_path",
+        }
+        if created_after:
+            params["created__date__gte"] = created_after
+        if created_before:
+            params["created__date__lte"] = created_before
+
         resp = await client.get(
             f"{PAPERLESS_API_URL}/api/documents/",
-            params={
-                "query": query,
-                "page": page,
-                "page_size": page_size,
-                "ordering": ordering,
-                "fields": "id,title,created,correspondent,document_type,storage_path",
-            },
+            params=params,
             headers=_headers(),
         )
         resp.raise_for_status()

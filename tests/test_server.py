@@ -258,6 +258,110 @@ class TestSearchDocumentsOrdering:
         assert params["ordering"] == "title"
 
     @pytest.mark.asyncio
+    async def test_created_after_forwarded(self):
+        """created_after sends created__date__gte to API."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents("Rechnung", created_after="2022-01-01")
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert params["created__date__gte"] == "2022-01-01"
+        assert "created__date__lte" not in params
+
+    @pytest.mark.asyncio
+    async def test_created_before_forwarded(self):
+        """created_before sends created__date__lte to API."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents("Rechnung", created_before="2022-12-31")
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert params["created__date__lte"] == "2022-12-31"
+        assert "created__date__gte" not in params
+
+    @pytest.mark.asyncio
+    async def test_both_date_filters_forwarded(self):
+        """Both date filters are sent to API together."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents(
+                "Rechnung",
+                created_after="2022-01-01",
+                created_before="2022-12-31",
+            )
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert params["created__date__gte"] == "2022-01-01"
+        assert params["created__date__lte"] == "2022-12-31"
+
+    @pytest.mark.asyncio
+    async def test_no_date_filters_by_default(self):
+        """Without date filters, no date params are sent."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"count": 0, "next": None, "results": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.search_documents("test")
+
+        call_kwargs = instance.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params")
+        assert "created__date__gte" not in params
+        assert "created__date__lte" not in params
+
+    @pytest.mark.asyncio
     async def test_created_field_in_results(self):
         """Results include the created date field."""
         paperless._correspondent_cache = {}

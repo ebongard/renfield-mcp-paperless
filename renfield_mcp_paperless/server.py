@@ -309,6 +309,7 @@ def _resolve_document(doc: dict, query: str | None = None) -> dict:
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
         "snippet": snippet,
+        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
 
     return result
@@ -565,6 +566,10 @@ async def get_document(document_id: int) -> dict:
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
         "original_file_name": doc.get("original_file_name"),
+        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
+        "custom_fields": doc.get("custom_fields"),   # [{field: id, value: ...}]
+        "page_count": doc.get("page_count"),
+        "added": doc.get("added"),
     }
 
 
@@ -575,12 +580,15 @@ async def update_document(
     correspondent: str | None = None,
     document_type: str | None = None,
     tags: list[str] | None = None,
+    created_date: str | None = None,
+    storage_path: str | None = None,
+    custom_fields: list[dict] | None = None,
 ) -> dict:
     """Update metadata of a document in Paperless-NGX.
 
     Only the fields you provide will be updated (PATCH semantics).
-    Use human-readable names for correspondent, document_type, and tags —
-    they are resolved to IDs automatically.
+    Use human-readable names for correspondent, document_type, tags, and
+    storage_path — they are resolved to IDs automatically.
 
     Args:
         document_id: Paperless document ID
@@ -588,6 +596,9 @@ async def update_document(
         correspondent: Correspondent name (must exist in Paperless)
         document_type: Document type name (must exist in Paperless)
         tags: List of tag names (must exist in Paperless)
+        created_date: Document creation date (YYYY-MM-DD)
+        storage_path: Storage path name (must exist in Paperless)
+        custom_fields: List of custom field dicts [{field: id, value: ...}]
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -621,6 +632,18 @@ async def update_document(
                 return {"error": f"Unknown tags: {unresolved}"}
             patch_data["tags"] = tag_ids
 
+        if created_date is not None:
+            patch_data["created"] = created_date
+
+        if storage_path is not None:
+            sp_id = _resolve_name_to_id(storage_path, _storage_path_cache or {})
+            if sp_id is None:
+                return {"error": f"Unknown storage path: '{storage_path}'"}
+            patch_data["storage_path"] = sp_id
+
+        if custom_fields is not None:
+            patch_data["custom_fields"] = custom_fields
+
         if not patch_data:
             return {"error": "No fields to update"}
 
@@ -649,6 +672,7 @@ async def update_document(
         "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
+        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
 
 
@@ -676,6 +700,56 @@ async def reprocess_document(document_id: int) -> dict:
         resp.raise_for_status()
 
     return {"id": document_id, "status": "reprocessing"}
+
+
+@mcp.tool()
+async def list_custom_fields() -> dict:
+    """List all custom field definitions from Paperless-NGX.
+
+    Returns field IDs, names, data types (string, url, date, boolean, integer, float, monetary, document_link, select).
+    Use this to discover available custom fields before auditing documents.
+    """
+    api_url = os.environ.get("PAPERLESS_API_URL", "")
+    token = os.environ.get("PAPERLESS_API_TOKEN", "")
+    if not api_url or not token:
+        return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            f"{api_url}/api/custom_fields/",
+            headers=_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+    fields = []
+    for f in data.get("results", data if isinstance(data, list) else []):
+        fields.append({
+            "id": f["id"],
+            "name": f["name"],
+            "data_type": f.get("data_type", "string"),
+            "extra_data": f.get("extra_data"),
+        })
+
+    return {"fields": fields}
+
+
+@mcp.tool()
+async def list_storage_paths() -> dict:
+    """List all storage paths from Paperless-NGX.
+
+    Returns path IDs and path strings. Use to discover available storage paths
+    for document organization.
+    """
+    api_url = os.environ.get("PAPERLESS_API_URL", "")
+    token = os.environ.get("PAPERLESS_API_TOKEN", "")
+    if not api_url or not token:
+        return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+    paths = [{"id": pid, "path": pname} for pid, pname in (_storage_path_cache or {}).items()]
+    return {"paths": paths}
 
 
 def main():

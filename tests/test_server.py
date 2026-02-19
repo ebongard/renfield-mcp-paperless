@@ -223,7 +223,7 @@ class TestResolveDocument:
         assert result["document_type"] == "Rechnung"
         assert result["tags"] == ["privat", "steuer"]
         assert result["snippet"] is not None
-        assert "storage_path" not in result
+        assert result["storage_path"] is None
 
     def test_null_ids_return_none(self):
         paperless._correspondent_cache = {}
@@ -1461,3 +1461,373 @@ class TestReprocessDocument:
         call_kwargs = instance.post.call_args.kwargs
         assert call_kwargs["json"]["documents"] == [123]
         assert call_kwargs["json"]["method"] == "reprocess"
+
+
+# ── get_document extended fields ─────────────────────────────────
+
+
+class TestGetDocumentExtendedFields:
+    @pytest.mark.asyncio
+    async def test_returns_storage_path_custom_fields_page_count_added(self):
+        """get_document returns storage_path, custom_fields, page_count, added."""
+        paperless._correspondent_cache = {1: "Telekom"}
+        paperless._document_type_cache = {2: "Rechnung"}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {10: "privat"}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 200
+        doc_resp.json.return_value = {
+            "id": 42,
+            "title": "Telekom Rechnung Januar",
+            "content": "Rechnungsbetrag: 49,99 EUR",
+            "created": "2030-01-15",
+            "correspondent": 1,
+            "document_type": 2,
+            "tags": [10],
+            "original_file_name": "telekom_jan.pdf",
+            "storage_path": 7,
+            "custom_fields": [{"field": 1, "value": "CF-001"}],
+            "page_count": 3,
+            "added": "2030-01-16T10:30:00Z",
+        }
+        doc_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.get_document(42)
+
+        assert result["storage_path"] == "archive/invoices"
+        assert result["custom_fields"] == [{"field": 1, "value": "CF-001"}]
+        assert result["page_count"] == 3
+        assert result["added"] == "2030-01-16T10:30:00Z"
+
+    @pytest.mark.asyncio
+    async def test_null_extended_fields(self):
+        """Extended fields return None when absent from API response."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 200
+        doc_resp.json.return_value = {
+            "id": 1,
+            "title": "Untitled",
+            "content": None,
+            "created": None,
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "original_file_name": None,
+        }
+        doc_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.get_document(1)
+
+        assert result["storage_path"] is None
+        assert result["custom_fields"] is None
+        assert result["page_count"] is None
+        assert result["added"] is None
+
+
+# ── update_document created_date ─────────────────────────────────
+
+
+class TestUpdateDocumentCreatedDate:
+    @pytest.mark.asyncio
+    async def test_created_date_sent_in_patch(self):
+        """Passing created_date sends 'created' in PATCH body."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "storage_path": None,
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, created_date="2024-01-15")
+
+        assert result["id"] == 42
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"created": "2024-01-15"}
+
+
+# ── update_document storage_path ─────────────────────────────────
+
+
+class TestUpdateDocumentStoragePath:
+    @pytest.mark.asyncio
+    async def test_storage_path_resolved_and_sent(self):
+        """Passing storage_path resolves to ID and includes in PATCH."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "storage_path": 7,
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, storage_path="archive/invoices")
+
+        assert result["storage_path"] == "archive/invoices"
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"storage_path": 7}
+
+    @pytest.mark.asyncio
+    async def test_unknown_storage_path_returns_error(self):
+        """Unknown storage_path returns error."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, storage_path="nonexistent/path")
+
+        assert "error" in result
+        assert "nonexistent/path" in result["error"]
+
+
+# ── update_document custom_fields ────────────────────────────────
+
+
+class TestUpdateDocumentCustomFields:
+    @pytest.mark.asyncio
+    async def test_custom_fields_sent_in_patch(self):
+        """Passing custom_fields includes them in the PATCH body as-is."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        custom = [{"field": 1, "value": "CF-001"}, {"field": 2, "value": True}]
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "storage_path": None,
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, custom_fields=custom)
+
+        assert result["id"] == 42
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"custom_fields": custom}
+
+
+# ── list_custom_fields ───────────────────────────────────────────
+
+
+class TestListCustomFields:
+    @pytest.mark.asyncio
+    async def test_successful_return(self):
+        """Returns fields list from API."""
+        api_resp = MagicMock()
+        api_resp.status_code = 200
+        api_resp.json.return_value = {
+            "results": [
+                {"id": 1, "name": "Invoice Number", "data_type": "string", "extra_data": None},
+                {"id": 2, "name": "Due Date", "data_type": "date", "extra_data": None},
+            ]
+        }
+        api_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=api_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.list_custom_fields()
+
+        assert len(result["fields"]) == 2
+        assert result["fields"][0] == {
+            "id": 1, "name": "Invoice Number", "data_type": "string", "extra_data": None
+        }
+        assert result["fields"][1] == {
+            "id": 2, "name": "Due Date", "data_type": "date", "extra_data": None
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self, monkeypatch):
+        monkeypatch.setenv("PAPERLESS_API_URL", "")
+        monkeypatch.setattr(paperless, "PAPERLESS_API_URL", "")
+        result = await paperless.list_custom_fields()
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self, monkeypatch):
+        monkeypatch.setenv("PAPERLESS_API_TOKEN", "")
+        monkeypatch.setattr(paperless, "PAPERLESS_API_TOKEN", "")
+        result = await paperless.list_custom_fields()
+        assert "error" in result
+
+
+# ── list_storage_paths ───────────────────────────────────────────
+
+
+class TestListStoragePaths:
+    @pytest.mark.asyncio
+    async def test_successful_return_from_cache(self):
+        """Returns paths from cache after _ensure_caches."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {1: "archive/invoices", 2: "archive/contracts"}
+        paperless._tag_cache = {}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.list_storage_paths()
+
+        assert len(result["paths"]) == 2
+        path_ids = {p["id"] for p in result["paths"]}
+        assert path_ids == {1, 2}
+        path_names = {p["path"] for p in result["paths"]}
+        assert path_names == {"archive/invoices", "archive/contracts"}
+
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self, monkeypatch):
+        monkeypatch.setenv("PAPERLESS_API_URL", "")
+        monkeypatch.setattr(paperless, "PAPERLESS_API_URL", "")
+        result = await paperless.list_storage_paths()
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self, monkeypatch):
+        monkeypatch.setenv("PAPERLESS_API_TOKEN", "")
+        monkeypatch.setattr(paperless, "PAPERLESS_API_TOKEN", "")
+        result = await paperless.list_storage_paths()
+        assert "error" in result
+
+
+# ── _resolve_document storage_path ───────────────────────────────
+
+
+class TestResolveDocumentStoragePath:
+    def test_includes_storage_path_when_present(self):
+        """_resolve_document includes storage_path in output."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {}
+
+        result = paperless._resolve_document({
+            "id": 1,
+            "title": "Test",
+            "created": "2030-01-15",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "content": None,
+            "storage_path": 7,
+        })
+
+        assert result["storage_path"] == "archive/invoices"
+
+    def test_storage_path_none_when_absent(self):
+        """_resolve_document returns None for storage_path when not set."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {}
+
+        result = paperless._resolve_document({
+            "id": 1,
+            "title": "Test",
+            "created": "2030-01-15",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "content": None,
+        })
+
+        assert result["storage_path"] is None
+
+    def test_storage_path_none_when_id_not_in_cache(self):
+        """_resolve_document returns None when storage_path ID not in cache."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {7: "archive/invoices"}
+        paperless._tag_cache = {}
+
+        result = paperless._resolve_document({
+            "id": 1,
+            "title": "Test",
+            "created": "2030-01-15",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "content": None,
+            "storage_path": 999,
+        })
+
+        assert result["storage_path"] is None

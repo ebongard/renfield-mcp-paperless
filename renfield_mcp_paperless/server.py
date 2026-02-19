@@ -519,6 +519,165 @@ async def upload_document(
     }
 
 
+@mcp.tool()
+async def get_document(document_id: int) -> dict:
+    """Get full details of a single document from Paperless-NGX by ID.
+
+    Returns the complete document including full OCR text content,
+    resolved correspondent/document_type/tag names, and original filename.
+    Use the document IDs from search_documents results.
+
+    Args:
+        document_id: Paperless document ID
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        resp = await client.get(
+            f"{PAPERLESS_API_URL}/api/documents/{document_id}/",
+            headers=_headers(),
+        )
+        if resp.status_code == 404:
+            return {"error": f"Document {document_id} not found"}
+        resp.raise_for_status()
+
+    doc = resp.json()
+
+    corr_id = doc.get("correspondent")
+    dtype_id = doc.get("document_type")
+    tag_ids = doc.get("tags") or []
+
+    resolved_tags = []
+    if tag_ids and _tag_cache:
+        resolved_tags = [_tag_cache[tid] for tid in tag_ids if tid in _tag_cache]
+
+    return {
+        "id": doc["id"],
+        "title": doc.get("title", ""),
+        "content": doc.get("content"),
+        "created": doc.get("created"),
+        "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
+        "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
+        "tags": resolved_tags if resolved_tags else None,
+        "original_file_name": doc.get("original_file_name"),
+    }
+
+
+@mcp.tool()
+async def update_document(
+    document_id: int,
+    title: str | None = None,
+    correspondent: str | None = None,
+    document_type: str | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Update metadata of a document in Paperless-NGX.
+
+    Only the fields you provide will be updated (PATCH semantics).
+    Use human-readable names for correspondent, document_type, and tags —
+    they are resolved to IDs automatically.
+
+    Args:
+        document_id: Paperless document ID
+        title: New document title
+        correspondent: Correspondent name (must exist in Paperless)
+        document_type: Document type name (must exist in Paperless)
+        tags: List of tag names (must exist in Paperless)
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        patch_data: dict = {}
+
+        if title is not None:
+            patch_data["title"] = title
+
+        if correspondent is not None:
+            corr_id = _resolve_name_to_id(correspondent, _correspondent_cache or {})
+            if corr_id is None:
+                return {"error": f"Unknown correspondent: '{correspondent}'"}
+            patch_data["correspondent"] = corr_id
+
+        if document_type is not None:
+            dt_id = _resolve_name_to_id(document_type, _document_type_cache or {})
+            if dt_id is None:
+                return {"error": f"Unknown document type: '{document_type}'"}
+            patch_data["document_type"] = dt_id
+
+        if tags is not None:
+            tag_ids = _resolve_tags_to_ids(tags, _tag_cache or {})
+            unresolved = [t for t in tags if _resolve_name_to_id(t, _tag_cache or {}) is None]
+            if unresolved:
+                return {"error": f"Unknown tags: {unresolved}"}
+            patch_data["tags"] = tag_ids
+
+        if not patch_data:
+            return {"error": "No fields to update"}
+
+        resp = await client.patch(
+            f"{PAPERLESS_API_URL}/api/documents/{document_id}/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json=patch_data,
+        )
+        if resp.status_code == 404:
+            return {"error": f"Document {document_id} not found"}
+        resp.raise_for_status()
+
+    doc = resp.json()
+
+    corr_id = doc.get("correspondent")
+    dtype_id = doc.get("document_type")
+    tag_ids = doc.get("tags") or []
+
+    resolved_tags = []
+    if tag_ids and _tag_cache:
+        resolved_tags = [_tag_cache[tid] for tid in tag_ids if tid in _tag_cache]
+
+    return {
+        "id": doc["id"],
+        "title": doc.get("title", ""),
+        "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
+        "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
+        "tags": resolved_tags if resolved_tags else None,
+    }
+
+
+@mcp.tool()
+async def reprocess_document(document_id: int) -> dict:
+    """Trigger reprocessing of a document in Paperless-NGX.
+
+    This re-runs OCR and content extraction on the document.
+    Useful after changing OCR settings or when content was not extracted correctly.
+
+    Args:
+        document_id: Paperless document ID
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/documents/bulk_edit/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={"documents": [document_id], "method": "reprocess"},
+        )
+        resp.raise_for_status()
+
+    return {"id": document_id, "status": "reprocessing"}
+
+
 def main():
     """Entry point for console script and python -m."""
     mcp.run(transport="stdio")

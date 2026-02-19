@@ -1007,3 +1007,457 @@ class TestResponseSize:
         }
         size = len(json.dumps(response).encode("utf-8"))
         assert size < 10240, f"Response is {size} bytes, exceeds 10KB"
+
+
+# ── get_document ────────────────────────────────────────────────
+
+
+class TestGetDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.get_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.get_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_get(self):
+        paperless._correspondent_cache = {1: "Telekom"}
+        paperless._document_type_cache = {2: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {10: "privat", 11: "steuer"}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 200
+        doc_resp.json.return_value = {
+            "id": 42,
+            "title": "Telekom Rechnung Januar",
+            "content": "Rechnungsbetrag: 49,99 EUR",
+            "created": "2030-01-15",
+            "correspondent": 1,
+            "document_type": 2,
+            "tags": [10, 11],
+            "original_file_name": "telekom_jan.pdf",
+        }
+        doc_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.get_document(42)
+
+        assert result["id"] == 42
+        assert result["title"] == "Telekom Rechnung Januar"
+        assert result["content"] == "Rechnungsbetrag: 49,99 EUR"
+        assert result["created"] == "2030-01-15"
+        assert result["correspondent"] == "Telekom"
+        assert result["document_type"] == "Rechnung"
+        assert result["tags"] == ["privat", "steuer"]
+        assert result["original_file_name"] == "telekom_jan.pdf"
+
+    @pytest.mark.asyncio
+    async def test_document_not_found(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 404
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.get_document(9999)
+
+        assert "error" in result
+        assert "9999" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_null_fields(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 200
+        doc_resp.json.return_value = {
+            "id": 1,
+            "title": "Untitled",
+            "content": None,
+            "created": None,
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "original_file_name": None,
+        }
+        doc_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.get_document(1)
+
+        assert result["correspondent"] is None
+        assert result["document_type"] is None
+        assert result["tags"] is None
+        assert result["content"] is None
+
+
+# ── update_document ─────────────────────────────────────────────
+
+
+class TestUpdateDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.update_document(1, title="New Title")
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.update_document(1, title="New Title")
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_no_fields_returns_error(self):
+        """Calling with no fields to update should return an error."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(1)
+
+        assert "error" in result
+        assert "No fields" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_title_only(self):
+        """PATCH semantics: only title is sent."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "New Title",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock()  # for _ensure_caches (won't be called with pre-set caches)
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, title="New Title")
+
+        assert result["id"] == 42
+        assert result["title"] == "New Title"
+
+        # Verify only title was sent in PATCH body
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"title": "New Title"}
+
+    @pytest.mark.asyncio
+    async def test_update_correspondent(self):
+        paperless._correspondent_cache = {5: "Telekom"}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": 5,
+            "document_type": None,
+            "tags": [],
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, correspondent="Telekom")
+
+        assert result["correspondent"] == "Telekom"
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"correspondent": 5}
+
+    @pytest.mark.asyncio
+    async def test_update_document_type(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {3: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": 3,
+            "tags": [],
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, document_type="Rechnung")
+
+        assert result["document_type"] == "Rechnung"
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"document_type": 3}
+
+    @pytest.mark.asyncio
+    async def test_update_tags(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {1: "privat", 2: "steuer"}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [1, 2],
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, tags=["privat", "steuer"])
+
+        assert result["tags"] == ["privat", "steuer"]
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"tags": [1, 2]}
+
+    @pytest.mark.asyncio
+    async def test_unknown_correspondent_returns_error(self):
+        paperless._correspondent_cache = {1: "Telekom"}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, correspondent="NonExistent")
+
+        assert "error" in result
+        assert "NonExistent" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_document_type_returns_error(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {1: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, document_type="NonExistent")
+
+        assert "error" in result
+        assert "NonExistent" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_tags_returns_error(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {1: "privat"}
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, tags=["privat", "nonexistent"])
+
+        assert "error" in result
+        assert "nonexistent" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_document_not_found(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 404
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(9999, title="New")
+
+        assert "error" in result
+        assert "9999" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_fields_sent_together(self):
+        """Multiple fields in one PATCH call."""
+        paperless._correspondent_cache = {5: "Telekom"}
+        paperless._document_type_cache = {3: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Updated",
+            "correspondent": 5,
+            "document_type": 3,
+            "tags": [],
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(
+                42, title="Updated", correspondent="Telekom", document_type="Rechnung"
+            )
+
+        call_kwargs = instance.patch.call_args
+        sent_json = call_kwargs.kwargs["json"]
+        assert sent_json == {"title": "Updated", "correspondent": 5, "document_type": 3}
+        assert result["title"] == "Updated"
+        assert result["correspondent"] == "Telekom"
+        assert result["document_type"] == "Rechnung"
+
+
+# ── reprocess_document ──────────────────────────────────────────
+
+
+class TestReprocessDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.reprocess_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.reprocess_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_reprocess(self):
+        post_resp = MagicMock()
+        post_resp.status_code = 200
+        post_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = AsyncMock(return_value=post_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.reprocess_document(42)
+
+        assert result["id"] == 42
+        assert result["status"] == "reprocessing"
+
+        # Verify the correct API call
+        call_args = instance.post.call_args
+        assert "/api/documents/bulk_edit/" in call_args.args[0]
+        assert call_args.kwargs["json"] == {"documents": [42], "method": "reprocess"}
+
+    @pytest.mark.asyncio
+    async def test_reprocess_sends_correct_body(self):
+        """Verify the exact POST body sent to the bulk_edit endpoint."""
+        post_resp = MagicMock()
+        post_resp.status_code = 200
+        post_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = AsyncMock(return_value=post_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            await paperless.reprocess_document(123)
+
+        call_kwargs = instance.post.call_args.kwargs
+        assert call_kwargs["json"]["documents"] == [123]
+        assert call_kwargs["json"]["method"] == "reprocess"

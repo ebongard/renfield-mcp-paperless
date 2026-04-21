@@ -1902,10 +1902,82 @@ class TestUploadDocumentMimeType:
         type application/octet-stream' must not be reachable via the happy path."""
         mock = _make_mock_upload_client()
         with patch("httpx.AsyncClient", return_value=mock):
+            # 100+ bytes so the size floor does not trip
+            import base64 as _b64
+            payload = _b64.b64encode(b"%PDF-1.4\n" + b"x" * 200).decode("ascii")
             await paperless.upload_document(
                 title="T",
-                file_content_base64="ZGF0YQ==",
+                file_content_base64=payload,
                 filename="doc.pdf",
             )
         file_tuple = mock.post.call_args.kwargs["files"]["document"]
         assert file_tuple[2] != "application/octet-stream"
+
+
+class TestUploadDocumentBase64Validation:
+    """Garbage-in / clear-error-out: real LLMs have been observed to pass
+    placeholder strings as ``file_content_base64``. The tool must not
+    silently forward corrupt bytes to Paperless."""
+
+    @pytest.mark.asyncio
+    async def test_placeholder_string_rejected(self):
+        """The exact string produced by a hallucinating LLM must surface as
+        an MCP-level error, not reach Paperless."""
+        result = await paperless.upload_document(
+            title="Invoice",
+            file_content_base64="base64_encoded_content_of_the_invoice",
+            filename="invoice.pdf",
+        )
+        assert "error" in result
+        assert "base64" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_garbage_with_invalid_chars_rejected(self):
+        """Non-base64 characters (``_``, ``!``, spaces) fail validation."""
+        result = await paperless.upload_document(
+            title="T",
+            file_content_base64="not!valid base64_at_all",
+            filename="x.pdf",
+        )
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_too_small_payload_rejected(self):
+        """Base64 that decodes to fewer than 100 bytes is refused with a
+        helpful error message — a real document cannot be that small."""
+        import base64 as _b64
+        tiny = _b64.b64encode(b"hello").decode("ascii")
+        result = await paperless.upload_document(
+            title="T",
+            file_content_base64=tiny,
+            filename="x.pdf",
+        )
+        assert "error" in result
+        assert "too small" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_validation_does_not_reach_paperless(self):
+        """When base64 validation fails, no HTTP request is made."""
+        mock = _make_mock_upload_client()
+        with patch("httpx.AsyncClient", return_value=mock):
+            await paperless.upload_document(
+                title="T",
+                file_content_base64="obviously_not_base64!",
+                filename="x.pdf",
+            )
+        assert mock.post.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_valid_payload_still_uploads(self):
+        """Positive control: a realistic base64 payload (>= 100 bytes) reaches Paperless."""
+        mock = _make_mock_upload_client()
+        import base64 as _b64
+        real = _b64.b64encode(b"%PDF-1.4\n" + b"content" * 20).decode("ascii")
+        with patch("httpx.AsyncClient", return_value=mock):
+            result = await paperless.upload_document(
+                title="T",
+                file_content_base64=real,
+                filename="real.pdf",
+            )
+        assert "error" not in result
+        assert mock.post.call_count == 1

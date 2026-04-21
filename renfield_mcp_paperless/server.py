@@ -488,10 +488,35 @@ async def upload_document(
     if not PAPERLESS_API_TOKEN:
         return {"error": "PAPERLESS_API_TOKEN not configured"}
 
+    # Strict decoding: reject non-base64 characters (``_``, spaces, etc.) up
+    # front instead of silently producing garbage bytes. LLM agents have been
+    # observed to pass placeholder strings like
+    # ``"base64_encoded_content_of_the_invoice"`` — those would decode without
+    # error under the default (lenient) setting and reach Paperless as a
+    # corrupt file, producing an opaque HTTP 400 with no useful error chain.
     try:
-        file_bytes = base64.b64decode(file_content_base64)
+        file_bytes = base64.b64decode(file_content_base64, validate=True)
     except Exception:
-        return {"error": "Invalid base64 content"}
+        return {
+            "error": (
+                "Invalid base64 content. The ``file_content_base64`` parameter "
+                "must be real base64-encoded file bytes, not a placeholder "
+                "string or description."
+            )
+        }
+
+    # Size floor: a real document cannot realistically be smaller than a PDF
+    # magic-byte header + one object. If the caller passed something short
+    # enough to be a placeholder that happened to be valid base64, fail fast
+    # with a clear message rather than forwarding obvious garbage to Paperless.
+    if len(file_bytes) < 100:
+        return {
+            "error": (
+                f"Decoded file is only {len(file_bytes)} bytes, which is too "
+                "small to be a real document. Make sure real file content is "
+                "being passed, not a placeholder."
+            )
+        }
 
     data: dict[str, str] = {"title": title}
     if correspondent:

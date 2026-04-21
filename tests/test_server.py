@@ -1831,3 +1831,81 @@ class TestResolveDocumentStoragePath:
         })
 
         assert result["storage_path"] is None
+
+
+# ── upload_document ──────────────────────────────────────────────
+
+def _make_mock_upload_client(task_id: str = "abc-123"):
+    """Mock httpx.AsyncClient whose POST returns a Paperless task id."""
+    post_resp = MagicMock()
+    post_resp.text = f'"{task_id}"'
+    post_resp.raise_for_status = MagicMock()
+
+    instance = AsyncMock()
+    instance.post = AsyncMock(return_value=post_resp)
+    instance.__aenter__ = AsyncMock(return_value=instance)
+    instance.__aexit__ = AsyncMock(return_value=False)
+    return instance
+
+
+class TestUploadDocumentMimeType:
+    """Paperless rejects application/octet-stream — verify the content-type
+    is always derived from the filename and sent as the third tuple element
+    in the multipart files= dict."""
+
+    @pytest.mark.asyncio
+    async def test_pdf_filename_sets_application_pdf(self):
+        mock = _make_mock_upload_client()
+        with patch("httpx.AsyncClient", return_value=mock):
+            await paperless.upload_document(
+                title="Invoice",
+                file_content_base64="JVBERi0xLjQK",  # arbitrary base64
+                filename="Invoice-1SOGUR2D-0011.pdf",
+            )
+
+        call_kwargs = mock.post.call_args.kwargs
+        file_tuple = call_kwargs["files"]["document"]
+        assert len(file_tuple) == 3, "httpx files tuple must include content-type"
+        assert file_tuple[0] == "Invoice-1SOGUR2D-0011.pdf"
+        assert file_tuple[2] == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_png_filename_sets_image_png(self):
+        mock = _make_mock_upload_client()
+        with patch("httpx.AsyncClient", return_value=mock):
+            await paperless.upload_document(
+                title="Scan",
+                file_content_base64="iVBORw0KGgo=",
+                filename="scan.png",
+            )
+        file_tuple = mock.post.call_args.kwargs["files"]["document"]
+        assert file_tuple[2] == "image/png"
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_falls_back_to_application_pdf(self):
+        """mimetypes.guess_type returns None for extensionless filenames — the
+        upload path must still produce a non-octet-stream content-type."""
+        mock = _make_mock_upload_client()
+        with patch("httpx.AsyncClient", return_value=mock):
+            await paperless.upload_document(
+                title="Mystery",
+                file_content_base64="ZGF0YQ==",
+                filename="no_extension_here",
+            )
+        file_tuple = mock.post.call_args.kwargs["files"]["document"]
+        assert file_tuple[2] != "application/octet-stream"
+        assert file_tuple[2] == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_never_sends_octet_stream(self):
+        """Regression guard for the original bug: Paperless 'Unsupported mime
+        type application/octet-stream' must not be reachable via the happy path."""
+        mock = _make_mock_upload_client()
+        with patch("httpx.AsyncClient", return_value=mock):
+            await paperless.upload_document(
+                title="T",
+                file_content_base64="ZGF0YQ==",
+                filename="doc.pdf",
+            )
+        file_tuple = mock.post.call_args.kwargs["files"]["document"]
+        assert file_tuple[2] != "application/octet-stream"

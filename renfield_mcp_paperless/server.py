@@ -13,6 +13,7 @@ Environment variables:
 
 import base64
 import logging
+import mimetypes
 import os
 import re
 import sys
@@ -501,11 +502,19 @@ async def upload_document(
         for i, tag in enumerate(tags):
             data[f"tags[{i}]"] = tag
 
+    # Paperless rejects application/octet-stream (httpx's default when the
+    # content-type tuple element is omitted). Derive the real MIME from the
+    # filename extension so the multipart upload carries a type Paperless'
+    # consumer will accept (application/pdf, image/png, ...).
+    content_type, _ = mimetypes.guess_type(filename)
+    if not content_type:
+        content_type = "application/pdf"  # sensible default for the common case
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{PAPERLESS_API_URL}/api/documents/post_document/",
             headers=_headers(),
-            files={"document": (filename, file_bytes)},
+            files={"document": (filename, file_bytes, content_type)},
             data=data,
         )
         resp.raise_for_status()

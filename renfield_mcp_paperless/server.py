@@ -11,6 +11,7 @@ Environment variables:
     PAPERLESS_API_TOKEN  — API authentication token
 """
 
+import asyncio
 import base64
 import logging
 import mimetypes
@@ -18,7 +19,7 @@ import os
 import re
 import sys
 from collections import Counter
-from typing import Optional
+from typing import Literal, Optional
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -63,38 +64,82 @@ async def _fetch_all_pages(client: httpx.AsyncClient, url: str) -> list[dict]:
 
 
 async def _ensure_caches(client: httpx.AsyncClient) -> None:
-    """Populate correspondent/document_type/storage_path/tag caches once."""
+    """Populate correspondent/document_type/storage_path/tag caches once.
+
+    Fetches run in parallel via ``asyncio.gather`` — typical cold-cache
+    cost drops from ~500 ms (four serial calls) to ~150 ms (one
+    round-trip's worth). Only dimensions whose cache is ``None`` get
+    fetched, so a partial invalidation (one dimension flushed by a
+    create_* tool) re-populates just that dimension.
+    """
     global _correspondent_cache, _document_type_cache, _storage_path_cache, _tag_cache
 
-    if _correspondent_cache is None:
-        items = await _fetch_all_pages(
-            client, f"{PAPERLESS_API_URL}/api/correspondents/?fields=id,name"
-        )
-        _correspondent_cache = {it["id"]: it["name"] for it in items}
-        logger.info("Cached %d correspondents", len(_correspondent_cache))
+    async def _load_correspondents():
+        global _correspondent_cache
+        if _correspondent_cache is None:
+            items = await _fetch_all_pages(
+                client, f"{PAPERLESS_API_URL}/api/correspondents/?fields=id,name"
+            )
+            _correspondent_cache = {it["id"]: it["name"] for it in items}
+            logger.info("Cached %d correspondents", len(_correspondent_cache))
 
-    if _document_type_cache is None:
-        items = await _fetch_all_pages(
-            client, f"{PAPERLESS_API_URL}/api/document_types/?fields=id,name"
-        )
-        _document_type_cache = {it["id"]: it["name"] for it in items}
-        logger.info("Cached %d document types", len(_document_type_cache))
+    async def _load_document_types():
+        global _document_type_cache
+        if _document_type_cache is None:
+            items = await _fetch_all_pages(
+                client, f"{PAPERLESS_API_URL}/api/document_types/?fields=id,name"
+            )
+            _document_type_cache = {it["id"]: it["name"] for it in items}
+            logger.info("Cached %d document types", len(_document_type_cache))
 
-    if _storage_path_cache is None:
-        items = await _fetch_all_pages(
-            client, f"{PAPERLESS_API_URL}/api/storage_paths/?fields=id,path,name"
-        )
-        _storage_path_cache = {
-            it["id"]: it.get("path", it.get("name", "")) for it in items
-        }
-        logger.info("Cached %d storage paths", len(_storage_path_cache))
+    async def _load_storage_paths():
+        global _storage_path_cache
+        if _storage_path_cache is None:
+            items = await _fetch_all_pages(
+                client, f"{PAPERLESS_API_URL}/api/storage_paths/?fields=id,path,name"
+            )
+            _storage_path_cache = {
+                it["id"]: it.get("path", it.get("name", "")) for it in items
+            }
+            logger.info("Cached %d storage paths", len(_storage_path_cache))
 
-    if _tag_cache is None:
-        items = await _fetch_all_pages(
-            client, f"{PAPERLESS_API_URL}/api/tags/?fields=id,name"
-        )
-        _tag_cache = {it["id"]: it["name"] for it in items}
-        logger.info("Cached %d tags", len(_tag_cache))
+    async def _load_tags():
+        global _tag_cache
+        if _tag_cache is None:
+            items = await _fetch_all_pages(
+                client, f"{PAPERLESS_API_URL}/api/tags/?fields=id,name"
+            )
+            _tag_cache = {it["id"]: it["name"] for it in items}
+            logger.info("Cached %d tags", len(_tag_cache))
+
+    await asyncio.gather(
+        _load_correspondents(),
+        _load_document_types(),
+        _load_storage_paths(),
+        _load_tags(),
+    )
+
+
+_CacheDimension = Literal["correspondent", "document_type", "storage_path", "tag"]
+
+
+def _invalidate_cache(dimension: _CacheDimension) -> None:
+    """Flush one taxonomy cache so the next ``_ensure_caches`` reloads it.
+
+    Called by each ``create_*`` tool after a successful create so that
+    Renfield's cache (which mirrors Paperless) picks up the new entry
+    immediately instead of waiting for the process-level TTL (10 min
+    in the Renfield-side extractor).
+    """
+    global _correspondent_cache, _document_type_cache, _storage_path_cache, _tag_cache
+    if dimension == "correspondent":
+        _correspondent_cache = None
+    elif dimension == "document_type":
+        _document_type_cache = None
+    elif dimension == "storage_path":
+        _storage_path_cache = None
+    elif dimension == "tag":
+        _tag_cache = None
 
 
 # --- Name → ID resolution helpers ---
@@ -461,6 +506,160 @@ async def download_document(document_id: int) -> dict:
     }
 
 
+# --- Upload helpers: task polling + PATCH with retry ---
+
+# How long to wait for Paperless's consume queue to produce a document id
+# before giving up and returning a "pending" result. Keep in line with the
+# LLM extraction latency budget — typical Paperless consume is < 10 s for
+# text PDFs, 15-30 s for image-PDFs with OCR. Exceed this and the post-upload
+# PATCH (storage_path, custom_fields) cannot run synchronously.
+_UPLOAD_TASK_POLL_TIMEOUT_S = 30.0
+_UPLOAD_TASK_POLL_INTERVAL_S = 1.0
+
+
+async def _poll_task_for_document_id(
+    client: httpx.AsyncClient, task_id: str, timeout_s: float | None = None
+) -> int | None:
+    """Poll Paperless's task endpoint until the consume task produces a
+    document id.
+
+    Returns the document id on success, or None if:
+      - the task fails in Paperless (FAILURE status),
+      - the timeout elapses before the task completes,
+      - the response shape is unexpected.
+
+    ``timeout_s`` defaults to ``_UPLOAD_TASK_POLL_TIMEOUT_S`` when omitted.
+    The default resolves at call time (not as a default-arg evaluation)
+    so tests can patch the module constant for shorter runs.
+
+    Callers should treat ``None`` as "document is queued, PATCH cannot run
+    now — surface to user and leave the document without post-upload
+    metadata."
+    """
+    import json as _json
+    if timeout_s is None:
+        timeout_s = _UPLOAD_TASK_POLL_TIMEOUT_S
+    loop = asyncio.get_running_loop()
+    url = f"{PAPERLESS_API_URL}/api/tasks/?task_id={task_id}"
+    deadline = loop.time() + timeout_s
+
+    while loop.time() < deadline:
+        try:
+            resp = await client.get(url, headers=_headers())
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Paperless's /api/tasks/?task_id= returns a list (usually
+            # length 0 while the task is still being registered, length 1
+            # once it's in the DB).
+            tasks = data if isinstance(data, list) else data.get("results", [])
+            if tasks:
+                task = tasks[0]
+                status = task.get("status")
+                if status == "SUCCESS":
+                    related = task.get("related_document")
+                    if related is not None:
+                        return int(related)
+                    logger.warning(
+                        "Task %s completed SUCCESS but has no related_document",
+                        task_id,
+                    )
+                    return None
+                if status == "FAILURE":
+                    logger.warning(
+                        "Task %s failed in Paperless: %s",
+                        task_id,
+                        task.get("result", "no details"),
+                    )
+                    return None
+        except (httpx.HTTPError, _json.JSONDecodeError, ValueError) as e:
+            # Narrow catch so programming errors (AttributeError, KeyError in
+            # our own code) don't get silently swallowed into a 30 s hang.
+            # Transient Paperless errors on /api/tasks/ do get retried.
+            logger.warning("Error polling task %s: %s", task_id, e)
+
+        await asyncio.sleep(_UPLOAD_TASK_POLL_INTERVAL_S)
+
+    logger.warning(
+        "Task %s did not complete within %.1fs; skipping post-upload PATCH",
+        task_id,
+        timeout_s,
+    )
+    return None
+
+
+async def _patch_document_with_retry(
+    client: httpx.AsyncClient, document_id: int, patch_data: dict, max_tries: int = 3
+) -> tuple[dict | None, str | None]:
+    """PATCH /api/documents/{id}/ with exponential backoff.
+
+    Returns ``(result_dict, None)`` on success, or ``(None, reason)`` on
+    failure where ``reason`` is one of:
+      - ``"client_error"`` — 4xx from Paperless (unknown id, invalid
+        format). Did not retry; retrying wouldn't help.
+      - ``"retries_exhausted"`` — all ``max_tries`` attempts failed with
+        transport errors or 5xx responses.
+
+    Backoff schedule: 0.5 s, 1.5 s, 4.5 s between attempts (≈ 6.5 s total
+    wall-clock worst case). Retries on httpx transport errors and any
+    5xx response; 4xx errors bail immediately.
+    """
+    url = f"{PAPERLESS_API_URL}/api/documents/{document_id}/"
+    last_exc: Exception | None = None
+    for attempt in range(max_tries):
+        try:
+            resp = await client.patch(
+                url,
+                headers={**_headers(), "Content-Type": "application/json"},
+                json=patch_data,
+            )
+            if 500 <= resp.status_code < 600:
+                last_exc = httpx.HTTPStatusError(
+                    f"{resp.status_code} on PATCH", request=resp.request, response=resp
+                )
+                logger.warning(
+                    "PATCH document %d got %d on attempt %d",
+                    document_id,
+                    resp.status_code,
+                    attempt + 1,
+                )
+            else:
+                resp.raise_for_status()
+                return resp.json(), None
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+            logger.warning(
+                "PATCH document %d transport error on attempt %d: %s",
+                document_id,
+                attempt + 1,
+                e,
+            )
+        except httpx.HTTPStatusError as e:
+            # 4xx → don't retry; the bind params are wrong (unknown id,
+            # invalid format), and waiting won't help. Return a distinct
+            # reason so the caller can distinguish "agent passed bad
+            # inputs" from "Paperless was overloaded."
+            logger.warning(
+                "PATCH document %d got non-retryable %d: %s",
+                document_id,
+                e.response.status_code,
+                e,
+            )
+            return None, "client_error"
+
+        # Exponential backoff: 0.5 s, 1.5 s, 4.5 s
+        if attempt < max_tries - 1:
+            await asyncio.sleep(0.5 * (3 ** attempt))
+
+    logger.warning(
+        "PATCH document %d exhausted %d attempts: %s",
+        document_id,
+        max_tries,
+        last_exc,
+    )
+    return None, "retries_exhausted"
+
+
 @mcp.tool()
 async def upload_document(
     title: str,
@@ -469,19 +668,39 @@ async def upload_document(
     correspondent: str | None = None,
     document_type: str | None = None,
     tags: list[str] | None = None,
+    storage_path: str | None = None,
+    created_date: str | None = None,
+    custom_fields: list[dict] | None = None,
 ) -> dict:
     """Upload a document to Paperless-NGX for OCR and archiving.
 
     Accepts a base64-encoded file and submits it to Paperless for processing.
     Returns a task ID that can be used to track the import status.
 
+    The fields that Paperless's ``post_document`` endpoint accepts directly
+    (``correspondent``, ``document_type``, ``tags``) are sent with the
+    initial POST. Fields that endpoint does NOT accept (``storage_path``,
+    ``created_date``, ``custom_fields``) trigger a second-step PATCH once
+    Paperless's consume queue produces the document id — see
+    ``§ renfield-mcp-paperless additions`` in
+    ``docs/design/paperless-llm-metadata.md``.
+
+    The PATCH waits up to 30 s for the consume task to complete. If the
+    task hasn't finished in that window, the response carries
+    ``post_upload_patch: "timed_out"`` and the caller should surface the
+    warning to the user — the document is still uploaded, but the extra
+    metadata couldn't be attached synchronously.
+
     Args:
         title: Document title
         file_content_base64: Base64-encoded file content
         filename: Original filename (default: document.pdf)
-        correspondent: Optional correspondent name
-        document_type: Optional document type name
-        tags: Optional list of tag names
+        correspondent: Optional correspondent name (must exist in Paperless)
+        document_type: Optional document type name (must exist in Paperless)
+        tags: Optional list of tag names (must exist in Paperless)
+        storage_path: Optional storage path name. Applied via post-upload PATCH.
+        created_date: Optional document creation date (YYYY-MM-DD). Applied via PATCH.
+        custom_fields: Optional list of ``[{field: id, value: ...}]``. Applied via PATCH.
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -535,6 +754,16 @@ async def upload_document(
     if not content_type:
         content_type = "application/pdf"  # sensible default for the common case
 
+    # Whether we need a post-upload PATCH. Empty list for custom_fields
+    # must NOT trigger a PATCH — doing so sends ``{"custom_fields": []}``
+    # which would WIPE any existing custom fields on the document. Treat
+    # empty list as "no-op, same as None" for the trigger check.
+    needs_patch = (
+        storage_path is not None
+        or created_date is not None
+        or (custom_fields is not None and len(custom_fields) > 0)
+    )
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{PAPERLESS_API_URL}/api/documents/post_document/",
@@ -544,14 +773,86 @@ async def upload_document(
         )
         resp.raise_for_status()
 
-    # Paperless returns the task ID as plain text
-    task_id = resp.text.strip().strip('"')
+        # Paperless returns the task ID as plain text (sometimes quoted)
+        task_id = resp.text.strip().strip('"')
 
-    return {
-        "task_id": task_id,
-        "title": title,
-        "filename": filename,
-    }
+        result: dict = {
+            "task_id": task_id,
+            "title": title,
+            "filename": filename,
+        }
+
+        if not needs_patch:
+            return result
+
+        # Phase 2: poll the task endpoint to get the document id, then
+        # issue a PATCH with the extra metadata fields. If polling times
+        # out or the PATCH all retries exhausted, return the upload
+        # success AND a patch-status flag so the caller can warn the user.
+        await _ensure_caches(client)
+
+        patch_data: dict = {}
+        if storage_path is not None:
+            sp_id = _resolve_name_to_id(storage_path, _storage_path_cache or {})
+            if sp_id is None:
+                result["post_upload_patch"] = "unknown_storage_path"
+                result["patch_error"] = f"Unknown storage path: {storage_path!r}"
+                return result
+            patch_data["storage_path"] = sp_id
+        if created_date is not None:
+            patch_data["created"] = created_date
+        if custom_fields:
+            # Empty list drops through intentionally — see `needs_patch`
+            # check above. Passing ``[]`` to Paperless wipes existing
+            # custom fields, which is destructive and almost certainly
+            # not what the caller wanted.
+            patch_data["custom_fields"] = custom_fields
+
+        document_id = await _poll_task_for_document_id(client, task_id)
+        if document_id is None:
+            result["post_upload_patch"] = "timed_out"
+            result["patch_error"] = (
+                f"Document was uploaded (task {task_id}) but Paperless's "
+                f"consume queue did not produce a document id within "
+                f"{_UPLOAD_TASK_POLL_TIMEOUT_S:.0f}s. The extra metadata "
+                "(storage_path / created_date / custom_fields) was NOT "
+                "attached. Set them manually in Paperless once the "
+                "document is consumed."
+            )
+            return result
+
+        result["document_id"] = document_id
+
+        patched, patch_reason = await _patch_document_with_retry(
+            client, document_id, patch_data
+        )
+        if patched is not None:
+            result["post_upload_patch"] = "success"
+        elif patch_reason == "client_error":
+            # 4xx from Paperless — usually means one of the resolved ids
+            # was stale (taxonomy changed between our cache warm-up and
+            # the PATCH) or the payload shape was malformed. Different
+            # recovery path than a transient 5xx: the caller shouldn't
+            # retry blindly.
+            result["post_upload_patch"] = "client_error"
+            result["patch_error"] = (
+                f"Document {document_id} was uploaded but the post-upload "
+                "PATCH failed with a 4xx response (check Paperless logs "
+                "for the specific reason). Retrying won't help — set the "
+                "extra metadata manually via update_document or in the "
+                "Paperless UI."
+            )
+        else:
+            # retries_exhausted (5xx / transport errors across all attempts)
+            result["post_upload_patch"] = "retries_exhausted"
+            result["patch_error"] = (
+                f"Document {document_id} was uploaded but the post-upload "
+                "PATCH failed after 3 retries on transient errors. The "
+                "extra metadata was NOT attached. Retry via update_document "
+                "or set it manually in Paperless."
+            )
+
+    return result
 
 
 @mcp.tool()
@@ -784,6 +1085,219 @@ async def list_storage_paths() -> dict:
         await _ensure_caches(client)
     paths = [{"id": pid, "path": pname} for pid, pname in (_storage_path_cache or {}).items()]
     return {"paths": paths}
+
+
+# --- Taxonomy create tools ---
+#
+# These four tools exist so Renfield's LLM-metadata extractor can propose
+# new correspondents / document_types / tags / storage_paths at confirm
+# time, and on user approval create them via a single tool call rather
+# than asking the user to open the Paperless admin UI.
+#
+# Every create_* tool:
+#   1. Pre-checks the name against the taxonomy cache — if the name is
+#      already present (exact, case-insensitive, or substring match via
+#      the same logic as _resolve_name_to_id), returns an ``already_exists``
+#      error with the existing id rather than creating a duplicate.
+#   2. POSTs to the Paperless API endpoint.
+#   3. Invalidates the corresponding in-process cache so the next
+#      ``_ensure_caches`` reflects the new entry.
+
+
+@mcp.tool()
+async def create_correspondent(name: str) -> dict:
+    """Create a new correspondent in Paperless-NGX.
+
+    Rejects duplicates (exact or near-match against existing cache). On
+    success, invalidates the correspondent cache so subsequent reads see
+    the new entry.
+
+    Args:
+        name: Correspondent name (must not be empty or already exist).
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+    if not name or not name.strip():
+        return {"error": "name must not be empty"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        existing_id = _resolve_name_to_id(name, _correspondent_cache or {})
+        if existing_id is not None:
+            return {
+                "error": "already_exists",
+                "existing_id": existing_id,
+                "existing_name": (_correspondent_cache or {}).get(existing_id),
+            }
+
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/correspondents/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={"name": name.strip()},
+        )
+        if resp.status_code == 400:
+            # Paperless rejects duplicates server-side too (case-sensitive).
+            # Surface the server's response rather than retrying.
+            return {"error": "bad_request", "details": resp.text}
+        resp.raise_for_status()
+
+    created = resp.json()
+    _invalidate_cache("correspondent")
+    return {"id": created["id"], "name": created["name"]}
+
+
+@mcp.tool()
+async def create_document_type(name: str) -> dict:
+    """Create a new document type in Paperless-NGX.
+
+    Rejects duplicates and invalidates the document_type cache on success.
+
+    Args:
+        name: Document type name (must not be empty or already exist).
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+    if not name or not name.strip():
+        return {"error": "name must not be empty"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        existing_id = _resolve_name_to_id(name, _document_type_cache or {})
+        if existing_id is not None:
+            return {
+                "error": "already_exists",
+                "existing_id": existing_id,
+                "existing_name": (_document_type_cache or {}).get(existing_id),
+            }
+
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/document_types/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={"name": name.strip()},
+        )
+        if resp.status_code == 400:
+            return {"error": "bad_request", "details": resp.text}
+        resp.raise_for_status()
+
+    created = resp.json()
+    _invalidate_cache("document_type")
+    return {"id": created["id"], "name": created["name"]}
+
+
+@mcp.tool()
+async def create_tag(name: str, color: str | None = None) -> dict:
+    """Create a new tag in Paperless-NGX.
+
+    Rejects duplicates and invalidates the tag cache on success.
+
+    Args:
+        name: Tag name (must not be empty or already exist).
+        color: Optional hex color like ``"#a6cee3"``. Paperless assigns
+               a default if omitted.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+    if not name or not name.strip():
+        return {"error": "name must not be empty"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        existing_id = _resolve_name_to_id(name, _tag_cache or {})
+        if existing_id is not None:
+            return {
+                "error": "already_exists",
+                "existing_id": existing_id,
+                "existing_name": (_tag_cache or {}).get(existing_id),
+            }
+
+        payload: dict = {"name": name.strip()}
+        if color:
+            payload["color"] = color
+
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/tags/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json=payload,
+        )
+        if resp.status_code == 400:
+            return {"error": "bad_request", "details": resp.text}
+        resp.raise_for_status()
+
+    created = resp.json()
+    _invalidate_cache("tag")
+    return {
+        "id": created["id"],
+        "name": created["name"],
+        "color": created.get("color"),
+    }
+
+
+@mcp.tool()
+async def create_storage_path(name: str, path: str) -> dict:
+    """Create a new storage path in Paperless-NGX.
+
+    Storage paths are templates for where Paperless saves the original
+    file on disk. Typical shapes:
+        ``{created_year}/{correspondent}/{title}``
+        ``/steuer/{created_year}``
+
+    Rejects duplicates (by name match) and invalidates the storage_path
+    cache on success.
+
+    Args:
+        name: Display name shown in Paperless UI (must not be empty).
+        path: Path template. See Paperless docs for available placeholders.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+    if not name or not name.strip():
+        return {"error": "name must not be empty"}
+    if not path or not path.strip():
+        return {"error": "path must not be empty"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+
+        # Storage-path cache values are the path strings themselves (see
+        # _ensure_caches). We resolve against both the name and the path
+        # to avoid creating a second entry that duplicates a path.
+        existing_id = _resolve_name_to_id(name, _storage_path_cache or {})
+        if existing_id is None:
+            existing_id = _resolve_name_to_id(path, _storage_path_cache or {})
+        if existing_id is not None:
+            return {
+                "error": "already_exists",
+                "existing_id": existing_id,
+                "existing_path": (_storage_path_cache or {}).get(existing_id),
+            }
+
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/storage_paths/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={"name": name.strip(), "path": path.strip()},
+        )
+        if resp.status_code == 400:
+            return {"error": "bad_request", "details": resp.text}
+        resp.raise_for_status()
+
+    created = resp.json()
+    _invalidate_cache("storage_path")
+    return {
+        "id": created["id"],
+        "name": created["name"],
+        "path": created.get("path"),
+    }
 
 
 def main():

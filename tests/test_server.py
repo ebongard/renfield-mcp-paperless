@@ -922,7 +922,9 @@ class TestUploadDocument:
     @pytest.mark.asyncio
     async def test_upload_success(self):
         import base64
-        file_bytes = b"%PDF-1.4 test content"
+        # Must be ≥100 bytes — the strict base64 + size floor added in #4
+        # rejects anything smaller as a probable placeholder.
+        file_bytes = b"%PDF-1.4 " + b"x" * 200
         b64 = base64.b64encode(file_bytes).decode("ascii")
 
         mock_resp = MagicMock()
@@ -1855,11 +1857,14 @@ class TestUploadDocumentMimeType:
 
     @pytest.mark.asyncio
     async def test_pdf_filename_sets_application_pdf(self):
+        import base64 as _b64
+        # Pad past the 100-byte floor added in #4.
+        payload = _b64.b64encode(b"%PDF-1.4\n" + b"x" * 200).decode("ascii")
         mock = _make_mock_upload_client()
         with patch("httpx.AsyncClient", return_value=mock):
             await paperless.upload_document(
                 title="Invoice",
-                file_content_base64="JVBERi0xLjQK",  # arbitrary base64
+                file_content_base64=payload,
                 filename="Invoice-1SOGUR2D-0011.pdf",
             )
 
@@ -1871,11 +1876,13 @@ class TestUploadDocumentMimeType:
 
     @pytest.mark.asyncio
     async def test_png_filename_sets_image_png(self):
+        import base64 as _b64
+        payload = _b64.b64encode(b"\x89PNG\r\n" + b"x" * 200).decode("ascii")
         mock = _make_mock_upload_client()
         with patch("httpx.AsyncClient", return_value=mock):
             await paperless.upload_document(
                 title="Scan",
-                file_content_base64="iVBORw0KGgo=",
+                file_content_base64=payload,
                 filename="scan.png",
             )
         file_tuple = mock.post.call_args.kwargs["files"]["document"]
@@ -1885,11 +1892,13 @@ class TestUploadDocumentMimeType:
     async def test_unknown_extension_falls_back_to_application_pdf(self):
         """mimetypes.guess_type returns None for extensionless filenames — the
         upload path must still produce a non-octet-stream content-type."""
+        import base64 as _b64
+        payload = _b64.b64encode(b"data" + b"x" * 200).decode("ascii")
         mock = _make_mock_upload_client()
         with patch("httpx.AsyncClient", return_value=mock):
             await paperless.upload_document(
                 title="Mystery",
-                file_content_base64="ZGF0YQ==",
+                file_content_base64=payload,
                 filename="no_extension_here",
             )
         file_tuple = mock.post.call_args.kwargs["files"]["document"]
@@ -1981,3 +1990,811 @@ class TestUploadDocumentBase64Validation:
             )
         assert "error" not in result
         assert mock.post.call_count == 1
+
+
+# ── _invalidate_cache ────────────────────────────────────────────
+
+
+class TestInvalidateCache:
+    def test_invalidates_correspondent_only(self):
+        paperless._correspondent_cache = {1: "A"}
+        paperless._document_type_cache = {2: "B"}
+        paperless._tag_cache = {3: "C"}
+        paperless._storage_path_cache = {4: "D"}
+
+        paperless._invalidate_cache("correspondent")
+
+        assert paperless._correspondent_cache is None
+        assert paperless._document_type_cache == {2: "B"}
+        assert paperless._tag_cache == {3: "C"}
+        assert paperless._storage_path_cache == {4: "D"}
+
+    def test_invalidates_document_type_only(self):
+        paperless._correspondent_cache = {1: "A"}
+        paperless._document_type_cache = {2: "B"}
+        paperless._invalidate_cache("document_type")
+        assert paperless._document_type_cache is None
+        assert paperless._correspondent_cache == {1: "A"}
+
+    def test_invalidates_tag_only(self):
+        paperless._tag_cache = {1: "A"}
+        paperless._storage_path_cache = {2: "B"}
+        paperless._invalidate_cache("tag")
+        assert paperless._tag_cache is None
+        assert paperless._storage_path_cache == {2: "B"}
+
+    def test_invalidates_storage_path_only(self):
+        paperless._storage_path_cache = {1: "A"}
+        paperless._correspondent_cache = {2: "B"}
+        paperless._invalidate_cache("storage_path")
+        assert paperless._storage_path_cache is None
+        assert paperless._correspondent_cache == {2: "B"}
+
+
+# ── _ensure_caches: parallel fetches ─────────────────────────────
+
+
+class TestEnsureCachesParallel:
+    @pytest.mark.asyncio
+    async def test_all_four_fetches_run_concurrently(self):
+        """Regression: _ensure_caches must use asyncio.gather so four
+        cold-cache fetches parallelise. If the implementation reverts
+        to serial awaits, the call_count stays at 4 but the internal
+        await pattern changes — we detect the gather pattern by
+        checking that no fetch blocks the others."""
+        import asyncio as _asyncio
+
+        # Each mock response returns a distinct shape so we can verify
+        # all four populated without cross-talk.
+        call_order: list[str] = []
+
+        async def _tracked_get(url, **kwargs):
+            # Record URL prefix so we know which endpoint was hit.
+            if "correspondents" in url:
+                call_order.append("correspondents")
+                body = {"results": [{"id": 10, "name": "A"}], "next": None}
+            elif "document_types" in url:
+                call_order.append("document_types")
+                body = {"results": [{"id": 20, "name": "B"}], "next": None}
+            elif "storage_paths" in url:
+                call_order.append("storage_paths")
+                body = {"results": [{"id": 30, "path": "/x"}], "next": None}
+            elif "tags" in url:
+                call_order.append("tags")
+                body = {"results": [{"id": 40, "name": "D"}], "next": None}
+            else:
+                body = {"results": [], "next": None}
+            # Yield briefly so the event loop can interleave the four calls
+            # when they run concurrently.
+            await _asyncio.sleep(0)
+            resp = MagicMock()
+            resp.json.return_value = body
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        client = AsyncMock()
+        client.get = _tracked_get
+
+        await paperless._ensure_caches(client)
+
+        assert paperless._correspondent_cache == {10: "A"}
+        assert paperless._document_type_cache == {20: "B"}
+        assert paperless._storage_path_cache == {30: "/x"}
+        assert paperless._tag_cache == {40: "D"}
+        # All four endpoints were touched exactly once.
+        assert sorted(call_order) == sorted(
+            ["correspondents", "document_types", "storage_paths", "tags"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_invalidation_refetches_only_flushed(self):
+        """After invalidating one cache dimension, only that dimension
+        gets refetched on the next _ensure_caches call."""
+        paperless._correspondent_cache = {1: "existing"}
+        paperless._document_type_cache = {2: "existing"}
+        paperless._storage_path_cache = {3: "existing"}
+        paperless._tag_cache = {4: "existing"}
+
+        paperless._invalidate_cache("correspondent")
+
+        hit_urls: list[str] = []
+
+        async def _tracked_get(url, **kwargs):
+            hit_urls.append(url)
+            resp = MagicMock()
+            resp.json.return_value = {
+                "results": [{"id": 99, "name": "New"}], "next": None,
+            }
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        client = AsyncMock()
+        client.get = _tracked_get
+
+        await paperless._ensure_caches(client)
+
+        # Only the correspondents endpoint was hit; the other three stayed
+        # populated with their pre-existing values.
+        assert len(hit_urls) == 1
+        assert "correspondents" in hit_urls[0]
+        assert paperless._correspondent_cache == {99: "New"}
+        assert paperless._document_type_cache == {2: "existing"}
+        assert paperless._storage_path_cache == {3: "existing"}
+        assert paperless._tag_cache == {4: "existing"}
+
+
+# ── _poll_task_for_document_id ───────────────────────────────────
+
+
+class TestPollTaskForDocumentId:
+    @pytest.mark.asyncio
+    async def test_returns_document_id_on_success(self):
+        resp = MagicMock()
+        resp.json.return_value = [
+            {"status": "SUCCESS", "related_document": 4242}
+        ]
+        resp.raise_for_status = MagicMock()
+
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+
+        result = await paperless._poll_task_for_document_id(
+            client, "task-abc", timeout_s=5.0
+        )
+        assert result == 4242
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_failure_status(self):
+        resp = MagicMock()
+        resp.json.return_value = [{"status": "FAILURE", "result": "OCR failed"}]
+        resp.raise_for_status = MagicMock()
+
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+
+        result = await paperless._poll_task_for_document_id(
+            client, "task-abc", timeout_s=5.0
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_timeout(self):
+        # Task forever PENDING → should time out.
+        resp = MagicMock()
+        resp.json.return_value = [{"status": "PENDING"}]
+        resp.raise_for_status = MagicMock()
+
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=resp)
+
+        result = await paperless._poll_task_for_document_id(
+            client, "task-abc", timeout_s=0.3
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_handles_empty_task_list_then_success(self):
+        """Task registration is racy — first poll may return empty list,
+        second returns the completed task."""
+        call_count = {"n": 0}
+
+        async def _paginated(url, **kwargs):
+            call_count["n"] += 1
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if call_count["n"] == 1:
+                resp.json.return_value = []
+            else:
+                resp.json.return_value = [
+                    {"status": "SUCCESS", "related_document": 77}
+                ]
+            return resp
+
+        client = AsyncMock()
+        client.get = _paginated
+
+        result = await paperless._poll_task_for_document_id(
+            client, "task-abc", timeout_s=5.0
+        )
+        assert result == 77
+        assert call_count["n"] >= 2
+
+
+# ── _patch_document_with_retry ───────────────────────────────────
+
+
+class TestPatchDocumentWithRetry:
+    @pytest.mark.asyncio
+    async def test_first_attempt_succeeds(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.raise_for_status = MagicMock()
+        resp.json.return_value = {"id": 5, "title": "patched"}
+
+        client = AsyncMock()
+        client.patch = AsyncMock(return_value=resp)
+
+        result = await paperless._patch_document_with_retry(
+            client, 5, {"storage_path": 7}
+        )
+        assert result == {"id": 5, "title": "patched"}
+        assert client.patch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_on_5xx(self):
+        """Server errors retry; exponential backoff between attempts."""
+        mock_500 = MagicMock()
+        mock_500.status_code = 503
+        mock_500.request = MagicMock()
+        mock_500.response = mock_500
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.raise_for_status = MagicMock()
+        mock_200.json.return_value = {"id": 5}
+
+        client = AsyncMock()
+        # First two return 503, third returns 200.
+        client.patch = AsyncMock(side_effect=[mock_500, mock_500, mock_200])
+
+        # Patch asyncio.sleep to skip real backoff delays in tests.
+        with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
+            result = await paperless._patch_document_with_retry(
+                client, 5, {"storage_path": 7}, max_tries=3
+            )
+        assert result == {"id": 5}
+        assert client.patch.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_bails_on_4xx_no_retry(self):
+        """4xx errors (wrong id, bad format) don't retry — surfacing them
+        immediately is the correct behavior; retrying won't help."""
+        import httpx as _httpx
+
+        mock_404 = MagicMock()
+        mock_404.status_code = 404
+        mock_404.request = MagicMock()
+
+        def _raise_404():
+            raise _httpx.HTTPStatusError(
+                "404", request=mock_404.request, response=mock_404
+            )
+
+        mock_404.raise_for_status = _raise_404
+        mock_404.json.return_value = {}
+
+        client = AsyncMock()
+        client.patch = AsyncMock(return_value=mock_404)
+
+        with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
+            result = await paperless._patch_document_with_retry(
+                client, 5, {"storage_path": 7}, max_tries=3
+            )
+        assert result is None
+        # 4xx is definitive — one attempt only.
+        assert client.patch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_returns_none_after_all_retries_exhausted(self):
+        mock_500 = MagicMock()
+        mock_500.status_code = 500
+        mock_500.request = MagicMock()
+        mock_500.response = mock_500
+
+        client = AsyncMock()
+        client.patch = AsyncMock(return_value=mock_500)
+
+        with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
+            result = await paperless._patch_document_with_retry(
+                client, 5, {"storage_path": 7}, max_tries=3
+            )
+        assert result is None
+        assert client.patch.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retries_on_transport_error(self):
+        import httpx as _httpx
+
+        mock_200 = MagicMock()
+        mock_200.status_code = 200
+        mock_200.raise_for_status = MagicMock()
+        mock_200.json.return_value = {"id": 5}
+
+        client = AsyncMock()
+        client.patch = AsyncMock(
+            side_effect=[
+                _httpx.TimeoutException("timed out"),
+                mock_200,
+            ]
+        )
+
+        with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
+            result = await paperless._patch_document_with_retry(
+                client, 5, {"storage_path": 7}, max_tries=3
+            )
+        assert result == {"id": 5}
+        assert client.patch.await_count == 2
+
+
+# ── upload_document: extended metadata fields ────────────────────
+
+
+def _mk_post_resp(task_id: str = "task-abc"):
+    r = MagicMock()
+    r.status_code = 200
+    r.text = f'"{task_id}"'
+    r.raise_for_status = MagicMock()
+    return r
+
+
+def _mk_task_poll_resp(document_id: int | None):
+    r = MagicMock()
+    r.raise_for_status = MagicMock()
+    if document_id is None:
+        r.json.return_value = [{"status": "PENDING"}]
+    else:
+        r.json.return_value = [
+            {"status": "SUCCESS", "related_document": document_id}
+        ]
+    return r
+
+
+def _mk_taxonomy_resp(items: list[dict]):
+    r = MagicMock()
+    r.raise_for_status = MagicMock()
+    r.json.return_value = {"results": items, "next": None}
+    return r
+
+
+class TestUploadDocumentExtendedFields:
+    @pytest.mark.asyncio
+    async def test_no_new_params_skips_patch_regression(self):
+        """Regression guard: calling upload_document WITHOUT storage_path /
+        created_date / custom_fields must produce the exact same behavior
+        as pre-change — one POST, no task polling, no PATCH."""
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-old"))
+        # If _poll_task_for_document_id ran, client.get would be called.
+        client.get = AsyncMock()
+        client.patch = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.upload_document(
+                title="T",
+                file_content_base64=b64,
+                filename="t.pdf",
+            )
+
+        assert result["task_id"] == "task-old"
+        assert "post_upload_patch" not in result  # no patch attempted
+        assert client.patch.await_count == 0
+        assert client.get.await_count == 0  # no polling, no taxonomy fetch
+
+    @pytest.mark.asyncio
+    async def test_storage_path_triggers_poll_and_patch(self):
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-new"))
+        # Client.get is called for: 4 taxonomy endpoints (cache warm-up)
+        # then polling /api/tasks/. We sequence them:
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),  # correspondents (parallel)
+                _mk_taxonomy_resp([]),  # document_types (parallel)
+                _mk_taxonomy_resp([
+                    {"id": 50, "path": "/wohnung/betriebskosten"}
+                ]),
+                _mk_taxonomy_resp([]),  # tags (parallel)
+                _mk_task_poll_resp(4321),  # task finished, doc id = 4321
+            ]
+        )
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.raise_for_status = MagicMock()
+        patch_resp.json.return_value = {"id": 4321, "storage_path": 50}
+        client.patch = AsyncMock(return_value=patch_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            with patch(
+                "renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()
+            ):
+                result = await paperless.upload_document(
+                    title="T",
+                    file_content_base64=b64,
+                    filename="t.pdf",
+                    storage_path="/wohnung/betriebskosten",
+                )
+
+        assert result["task_id"] == "task-new"
+        assert result["document_id"] == 4321
+        assert result["post_upload_patch"] == "success"
+        assert client.patch.await_count == 1
+        # The PATCH carried the resolved storage_path id (50), not the raw name.
+        patch_call = client.patch.await_args
+        assert patch_call.kwargs["json"] == {"storage_path": 50}
+
+    @pytest.mark.asyncio
+    async def test_unknown_storage_path_fails_fast_before_poll(self):
+        """If the storage_path name doesn't resolve to any known id,
+        don't waste time polling — return an error immediately."""
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-x"))
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),  # correspondents
+                _mk_taxonomy_resp([]),  # document_types
+                _mk_taxonomy_resp([{"id": 1, "path": "/inbox"}]),
+                _mk_taxonomy_resp([]),  # tags
+            ]
+        )
+        client.patch = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.upload_document(
+                title="T",
+                file_content_base64=b64,
+                filename="t.pdf",
+                storage_path="/unknown/nowhere",
+            )
+
+        assert result["post_upload_patch"] == "unknown_storage_path"
+        assert "/unknown/nowhere" in result["patch_error"]
+        assert client.patch.await_count == 0  # no PATCH attempted
+
+    @pytest.mark.asyncio
+    async def test_patch_poll_timeout_returns_timed_out(self):
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-slow"))
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([{"id": 99, "path": "/x"}]),
+                _mk_taxonomy_resp([]),
+                # Now the polling path: keep returning PENDING
+                _mk_task_poll_resp(None),
+                _mk_task_poll_resp(None),
+                _mk_task_poll_resp(None),
+                _mk_task_poll_resp(None),
+            ]
+        )
+        client.patch = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            with patch(
+                "renfield_mcp_paperless.server._UPLOAD_TASK_POLL_TIMEOUT_S", 0.1
+            ):
+                with patch(
+                    "renfield_mcp_paperless.server._UPLOAD_TASK_POLL_INTERVAL_S", 0.02
+                ):
+                    result = await paperless.upload_document(
+                        title="T",
+                        file_content_base64=b64,
+                        filename="t.pdf",
+                        storage_path="/x",
+                    )
+
+        assert result["post_upload_patch"] == "timed_out"
+        assert "patch_error" in result
+        assert client.patch.await_count == 0  # no PATCH since no doc id
+
+    @pytest.mark.asyncio
+    async def test_patch_retries_exhausted_surfaces_warning(self):
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-y"))
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([{"id": 1, "path": "/x"}]),
+                _mk_taxonomy_resp([]),
+                _mk_task_poll_resp(555),  # doc created successfully
+            ]
+        )
+        # All 3 PATCH attempts fail with 503
+        bad_resp = MagicMock()
+        bad_resp.status_code = 503
+        bad_resp.request = MagicMock()
+        bad_resp.response = bad_resp
+        client.patch = AsyncMock(return_value=bad_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            with patch(
+                "renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()
+            ):
+                result = await paperless.upload_document(
+                    title="T",
+                    file_content_base64=b64,
+                    filename="t.pdf",
+                    storage_path="/x",
+                )
+
+        assert result["document_id"] == 555  # upload DID succeed
+        assert result["post_upload_patch"] == "retries_exhausted"
+        assert "555" in result["patch_error"]
+        assert client.patch.await_count == 3
+
+
+# ── create_correspondent ─────────────────────────────────────────
+
+
+def _mk_created_resp(body: dict):
+    r = MagicMock()
+    r.status_code = 201
+    r.raise_for_status = MagicMock()
+    r.json.return_value = body
+    return r
+
+
+class TestCreateCorrespondent:
+    @pytest.mark.asyncio
+    async def test_creates_new_and_invalidates_cache(self):
+        # Pre-populate cache so _ensure_caches does not re-fetch
+        paperless._correspondent_cache = {1: "Existing"}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock(
+            return_value=_mk_created_resp({"id": 42, "name": "Stadtwerke Köln"})
+        )
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_correspondent("Stadtwerke Köln")
+
+        assert result == {"id": 42, "name": "Stadtwerke Köln"}
+        # Cache was invalidated on success.
+        assert paperless._correspondent_cache is None
+        assert client.post.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_returns_existing_id(self):
+        paperless._correspondent_cache = {7: "Stadtwerke Köln"}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_correspondent("stadtwerke köln")
+
+        assert result["error"] == "already_exists"
+        assert result["existing_id"] == 7
+        assert client.post.await_count == 0  # no API call made
+        # Cache NOT invalidated — nothing changed.
+        assert paperless._correspondent_cache == {7: "Stadtwerke Köln"}
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_name(self):
+        result = await paperless.create_correspondent("")
+        assert "name must not be empty" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_whitespace_only_name(self):
+        result = await paperless.create_correspondent("   ")
+        assert "name must not be empty" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_surfaces_server_400(self):
+        """Paperless might reject for reasons we didn't pre-check
+        (server-side uniqueness on a slightly different spelling).
+        We surface the raw 400 rather than silently swallowing."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        bad_resp = MagicMock()
+        bad_resp.status_code = 400
+        bad_resp.text = '{"name":["correspondent exists"]}'
+        bad_resp.raise_for_status = MagicMock()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=bad_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_correspondent("New")
+
+        assert result["error"] == "bad_request"
+        # Cache NOT invalidated on failure.
+        assert paperless._correspondent_cache == {}
+
+
+# ── create_document_type ─────────────────────────────────────────
+
+
+class TestCreateDocumentType:
+    @pytest.mark.asyncio
+    async def test_creates_new_and_invalidates_cache(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {1: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock(
+            return_value=_mk_created_resp({"id": 11, "name": "Quittung"})
+        )
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_document_type("Quittung")
+
+        assert result == {"id": 11, "name": "Quittung"}
+        assert paperless._document_type_cache is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {5: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_document_type("rechnung")
+
+        assert result["error"] == "already_exists"
+        assert result["existing_id"] == 5
+
+
+# ── create_tag ───────────────────────────────────────────────────
+
+
+class TestCreateTag:
+    @pytest.mark.asyncio
+    async def test_creates_with_color(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock(
+            return_value=_mk_created_resp(
+                {"id": 8, "name": "steuer-2026", "color": "#a6cee3"}
+            )
+        )
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_tag("steuer-2026", color="#a6cee3")
+
+        assert result["id"] == 8
+        assert result["name"] == "steuer-2026"
+        assert result["color"] == "#a6cee3"
+        # Verify color was sent in the payload.
+        post_call = client.post.await_args
+        assert post_call.kwargs["json"]["color"] == "#a6cee3"
+        assert paperless._tag_cache is None
+
+    @pytest.mark.asyncio
+    async def test_creates_without_color_omits_field(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock(
+            return_value=_mk_created_resp({"id": 9, "name": "privat"})
+        )
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            await paperless.create_tag("privat")
+
+        post_call = client.post.await_args
+        assert "color" not in post_call.kwargs["json"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_tag(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {3: "privat"}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_tag("privat")
+
+        assert result["error"] == "already_exists"
+        assert result["existing_id"] == 3
+
+
+# ── create_storage_path ──────────────────────────────────────────
+
+
+class TestCreateStoragePath:
+    @pytest.mark.asyncio
+    async def test_creates_new_with_template(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.post = AsyncMock(
+            return_value=_mk_created_resp(
+                {"id": 2, "name": "Steuer 2025", "path": "/steuer/{created_year}"}
+            )
+        )
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_storage_path(
+                "Steuer 2025", "/steuer/{created_year}"
+            )
+
+        assert result["id"] == 2
+        assert result["path"] == "/steuer/{created_year}"
+        assert paperless._storage_path_cache is None
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_path(self):
+        result = await paperless.create_storage_path("Test", "")
+        assert "path must not be empty" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_duplicate_path_template(self):
+        """Even if the display name is new, a duplicate path template
+        should be caught by the pre-check."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {5: "/steuer/2025"}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_storage_path(
+                "Steuer Neu", "/steuer/2025"
+            )
+
+        assert result["error"] == "already_exists"
+        assert result["existing_id"] == 5

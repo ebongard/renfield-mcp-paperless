@@ -2941,3 +2941,160 @@ class TestCreateStoragePath:
 
         assert result["error"] == "already_exists"
         assert result["existing_id"] == 5
+
+
+# ── list_correspondents / list_document_types / list_tags ────────
+
+
+class TestListCorrespondents:
+    @pytest.mark.asyncio
+    async def test_returns_cached_items(self):
+        paperless._correspondent_cache = {
+            1: "Stadtwerke Korschenbroich",
+            2: "Finanzamt Neuss",
+        }
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock()  # cache warm, no fetches expected
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_correspondents()
+
+        assert result == {
+            "items": [
+                {"id": 1, "name": "Stadtwerke Korschenbroich"},
+                {"id": 2, "name": "Finanzamt Neuss"},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_empty_cache_returns_empty_list(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_correspondents()
+
+        assert result == {"items": []}
+
+    @pytest.mark.asyncio
+    async def test_missing_config_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.list_correspondents()
+        assert "error" in result
+
+
+class TestListDocumentTypes:
+    @pytest.mark.asyncio
+    async def test_returns_cached_items(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {10: "Rechnung", 20: "Vertrag"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_document_types()
+
+        assert result == {
+            "items": [
+                {"id": 10, "name": "Rechnung"},
+                {"id": 20, "name": "Vertrag"},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_missing_config_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.list_document_types()
+        assert "error" in result
+
+
+class TestListTags:
+    @pytest.mark.asyncio
+    async def test_returns_cached_items(self):
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {100: "wohnung", 101: "steuer-2025"}
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_tags()
+
+        assert result == {
+            "items": [
+                {"id": 100, "name": "wohnung"},
+                {"id": 101, "name": "steuer-2025"},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_populates_cache_if_empty(self):
+        """When the cache is None (not yet loaded), the tool triggers
+        _ensure_caches which populates it from the Paperless API."""
+        # Cache not yet loaded.
+        paperless._correspondent_cache = None
+        paperless._document_type_cache = None
+        paperless._storage_path_cache = None
+        paperless._tag_cache = None
+
+        # Mock _ensure_caches's parallel fetches: all four endpoints
+        # return one item each.
+        async def _fake_get(url, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            if "correspondents" in url:
+                resp.json.return_value = {
+                    "results": [{"id": 1, "name": "A"}], "next": None,
+                }
+            elif "document_types" in url:
+                resp.json.return_value = {
+                    "results": [{"id": 2, "name": "B"}], "next": None,
+                }
+            elif "storage_paths" in url:
+                resp.json.return_value = {
+                    "results": [{"id": 3, "path": "/x"}], "next": None,
+                }
+            elif "tags" in url:
+                resp.json.return_value = {
+                    "results": [{"id": 4, "name": "D"}], "next": None,
+                }
+            else:
+                resp.json.return_value = {"results": [], "next": None}
+            return resp
+
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = _fake_get
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_tags()
+
+        # Cache got populated; list_tags returns the one tag.
+        assert result == {"items": [{"id": 4, "name": "D"}]}
+        # And the other caches got populated too — parallel fetch.
+        assert paperless._correspondent_cache == {1: "A"}
+        assert paperless._document_type_cache == {2: "B"}
+        assert paperless._storage_path_cache == {3: "/x"}

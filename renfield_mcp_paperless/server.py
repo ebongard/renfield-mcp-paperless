@@ -1087,6 +1087,77 @@ async def list_storage_paths() -> dict:
     return {"paths": paths}
 
 
+# --- Taxonomy list tools (siblings of list_storage_paths) ---
+#
+# These three exist so Renfield's LLM-metadata extractor can fetch the
+# current Paperless taxonomy in one round-trip per dimension. The
+# underlying caches are already populated by ``_ensure_caches``; these
+# tools are thin read-only accessors that shape the response as
+# ``{"items": [{"id": ..., "name": ...}]}``, matching the convention
+# consumer code expects.
+
+
+@mcp.tool()
+async def list_correspondents() -> dict:
+    """List all correspondents from Paperless-NGX.
+
+    Returns correspondent IDs and names. Use to discover which
+    correspondents already exist before creating a new one via
+    ``create_correspondent`` and as the taxonomy input for LLM-driven
+    metadata extraction.
+    """
+    if not PAPERLESS_API_URL or not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+    items = [
+        {"id": cid, "name": cname}
+        for cid, cname in (_correspondent_cache or {}).items()
+    ]
+    return {"items": items}
+
+
+@mcp.tool()
+async def list_document_types() -> dict:
+    """List all document types from Paperless-NGX.
+
+    Returns document-type IDs and names. Use to discover which types
+    already exist before creating a new one via ``create_document_type``
+    and as the taxonomy input for LLM-driven metadata extraction.
+    """
+    if not PAPERLESS_API_URL or not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+    items = [
+        {"id": did, "name": dname}
+        for did, dname in (_document_type_cache or {}).items()
+    ]
+    return {"items": items}
+
+
+@mcp.tool()
+async def list_tags() -> dict:
+    """List all tags from Paperless-NGX.
+
+    Returns tag IDs and names. Use to discover which tags already exist
+    before creating a new one via ``create_tag`` and as the taxonomy
+    input for LLM-driven metadata extraction.
+    """
+    if not PAPERLESS_API_URL or not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _ensure_caches(client)
+    items = [
+        {"id": tid, "name": tname}
+        for tid, tname in (_tag_cache or {}).items()
+    ]
+    return {"items": items}
+
+
 # --- Taxonomy create tools ---
 #
 # These four tools exist so Renfield's LLM-metadata extractor can propose

@@ -536,12 +536,14 @@ async def _poll_task_for_document_id(
     now — surface to user and leave the document without post-upload
     metadata."
     """
+    import json as _json
     if timeout_s is None:
         timeout_s = _UPLOAD_TASK_POLL_TIMEOUT_S
+    loop = asyncio.get_running_loop()
     url = f"{PAPERLESS_API_URL}/api/tasks/?task_id={task_id}"
-    deadline = asyncio.get_event_loop().time() + timeout_s
+    deadline = loop.time() + timeout_s
 
-    while asyncio.get_event_loop().time() < deadline:
+    while loop.time() < deadline:
         try:
             resp = await client.get(url, headers=_headers())
             resp.raise_for_status()
@@ -570,7 +572,10 @@ async def _poll_task_for_document_id(
                         task.get("result", "no details"),
                     )
                     return None
-        except Exception as e:
+        except (httpx.HTTPError, _json.JSONDecodeError, ValueError) as e:
+            # Narrow catch so programming errors (AttributeError, KeyError in
+            # our own code) don't get silently swallowed into a 30 s hang.
+            # Transient Paperless errors on /api/tasks/ do get retried.
             logger.warning("Error polling task %s: %s", task_id, e)
 
         await asyncio.sleep(_UPLOAD_TASK_POLL_INTERVAL_S)
@@ -585,14 +590,19 @@ async def _poll_task_for_document_id(
 
 async def _patch_document_with_retry(
     client: httpx.AsyncClient, document_id: int, patch_data: dict, max_tries: int = 3
-) -> dict | None:
+) -> tuple[dict | None, str | None]:
     """PATCH /api/documents/{id}/ with exponential backoff.
 
-    Returns the updated document dict on success, or ``None`` if all
-    retries exhausted. Backoff schedule: 0.5 s, 1.5 s, 4.5 s between
-    attempts (≈ 6.5 s total wall-clock worst case). Retries on httpx
-    transport errors and any 5xx response; 4xx errors (e.g. unknown
-    storage_path id) bail immediately because retrying won't help.
+    Returns ``(result_dict, None)`` on success, or ``(None, reason)`` on
+    failure where ``reason`` is one of:
+      - ``"client_error"`` — 4xx from Paperless (unknown id, invalid
+        format). Did not retry; retrying wouldn't help.
+      - ``"retries_exhausted"`` — all ``max_tries`` attempts failed with
+        transport errors or 5xx responses.
+
+    Backoff schedule: 0.5 s, 1.5 s, 4.5 s between attempts (≈ 6.5 s total
+    wall-clock worst case). Retries on httpx transport errors and any
+    5xx response; 4xx errors bail immediately.
     """
     url = f"{PAPERLESS_API_URL}/api/documents/{document_id}/"
     last_exc: Exception | None = None
@@ -615,7 +625,7 @@ async def _patch_document_with_retry(
                 )
             else:
                 resp.raise_for_status()
-                return resp.json()
+                return resp.json(), None
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last_exc = e
             logger.warning(
@@ -626,14 +636,16 @@ async def _patch_document_with_retry(
             )
         except httpx.HTTPStatusError as e:
             # 4xx → don't retry; the bind params are wrong (unknown id,
-            # invalid format), and waiting won't help.
+            # invalid format), and waiting won't help. Return a distinct
+            # reason so the caller can distinguish "agent passed bad
+            # inputs" from "Paperless was overloaded."
             logger.warning(
                 "PATCH document %d got non-retryable %d: %s",
                 document_id,
                 e.response.status_code,
                 e,
             )
-            return None
+            return None, "client_error"
 
         # Exponential backoff: 0.5 s, 1.5 s, 4.5 s
         if attempt < max_tries - 1:
@@ -645,7 +657,7 @@ async def _patch_document_with_retry(
         max_tries,
         last_exc,
     )
-    return None
+    return None, "retries_exhausted"
 
 
 @mcp.tool()
@@ -742,9 +754,14 @@ async def upload_document(
     if not content_type:
         content_type = "application/pdf"  # sensible default for the common case
 
-    # Whether we need a post-upload PATCH for storage_path / created / custom.
-    needs_patch = any(
-        v is not None for v in (storage_path, created_date, custom_fields)
+    # Whether we need a post-upload PATCH. Empty list for custom_fields
+    # must NOT trigger a PATCH — doing so sends ``{"custom_fields": []}``
+    # which would WIPE any existing custom fields on the document. Treat
+    # empty list as "no-op, same as None" for the trigger check.
+    needs_patch = (
+        storage_path is not None
+        or created_date is not None
+        or (custom_fields is not None and len(custom_fields) > 0)
     )
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -784,7 +801,11 @@ async def upload_document(
             patch_data["storage_path"] = sp_id
         if created_date is not None:
             patch_data["created"] = created_date
-        if custom_fields is not None:
+        if custom_fields:
+            # Empty list drops through intentionally — see `needs_patch`
+            # check above. Passing ``[]`` to Paperless wipes existing
+            # custom fields, which is destructive and almost certainly
+            # not what the caller wanted.
             patch_data["custom_fields"] = custom_fields
 
         document_id = await _poll_task_for_document_id(client, task_id)
@@ -802,17 +823,34 @@ async def upload_document(
 
         result["document_id"] = document_id
 
-        patched = await _patch_document_with_retry(client, document_id, patch_data)
-        if patched is None:
+        patched, patch_reason = await _patch_document_with_retry(
+            client, document_id, patch_data
+        )
+        if patched is not None:
+            result["post_upload_patch"] = "success"
+        elif patch_reason == "client_error":
+            # 4xx from Paperless — usually means one of the resolved ids
+            # was stale (taxonomy changed between our cache warm-up and
+            # the PATCH) or the payload shape was malformed. Different
+            # recovery path than a transient 5xx: the caller shouldn't
+            # retry blindly.
+            result["post_upload_patch"] = "client_error"
+            result["patch_error"] = (
+                f"Document {document_id} was uploaded but the post-upload "
+                "PATCH failed with a 4xx response (check Paperless logs "
+                "for the specific reason). Retrying won't help — set the "
+                "extra metadata manually via update_document or in the "
+                "Paperless UI."
+            )
+        else:
+            # retries_exhausted (5xx / transport errors across all attempts)
             result["post_upload_patch"] = "retries_exhausted"
             result["patch_error"] = (
                 f"Document {document_id} was uploaded but the post-upload "
-                "PATCH failed after 3 retries. The extra metadata was NOT "
-                "attached. Set it manually in Paperless or retry via "
-                "update_document."
+                "PATCH failed after 3 retries on transient errors. The "
+                "extra metadata was NOT attached. Retry via update_document "
+                "or set it manually in Paperless."
             )
-        else:
-            result["post_upload_patch"] = "success"
 
     return result
 

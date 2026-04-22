@@ -2214,10 +2214,11 @@ class TestPatchDocumentWithRetry:
         client = AsyncMock()
         client.patch = AsyncMock(return_value=resp)
 
-        result = await paperless._patch_document_with_retry(
+        result, reason = await paperless._patch_document_with_retry(
             client, 5, {"storage_path": 7}
         )
         assert result == {"id": 5, "title": "patched"}
+        assert reason is None
         assert client.patch.await_count == 1
 
     @pytest.mark.asyncio
@@ -2239,16 +2240,18 @@ class TestPatchDocumentWithRetry:
 
         # Patch asyncio.sleep to skip real backoff delays in tests.
         with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
-            result = await paperless._patch_document_with_retry(
+            result, reason = await paperless._patch_document_with_retry(
                 client, 5, {"storage_path": 7}, max_tries=3
             )
         assert result == {"id": 5}
+        assert reason is None
         assert client.patch.await_count == 3
 
     @pytest.mark.asyncio
-    async def test_bails_on_4xx_no_retry(self):
-        """4xx errors (wrong id, bad format) don't retry — surfacing them
-        immediately is the correct behavior; retrying won't help."""
+    async def test_bails_on_4xx_with_client_error_reason(self):
+        """4xx errors (wrong id, bad format) don't retry. Return shape
+        must distinguish this from retries_exhausted so the caller can
+        pick the right recovery path."""
         import httpx as _httpx
 
         mock_404 = MagicMock()
@@ -2267,15 +2270,16 @@ class TestPatchDocumentWithRetry:
         client.patch = AsyncMock(return_value=mock_404)
 
         with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
-            result = await paperless._patch_document_with_retry(
+            result, reason = await paperless._patch_document_with_retry(
                 client, 5, {"storage_path": 7}, max_tries=3
             )
         assert result is None
+        assert reason == "client_error"
         # 4xx is definitive — one attempt only.
         assert client.patch.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_returns_none_after_all_retries_exhausted(self):
+    async def test_returns_retries_exhausted_reason(self):
         mock_500 = MagicMock()
         mock_500.status_code = 500
         mock_500.request = MagicMock()
@@ -2285,10 +2289,11 @@ class TestPatchDocumentWithRetry:
         client.patch = AsyncMock(return_value=mock_500)
 
         with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
-            result = await paperless._patch_document_with_retry(
+            result, reason = await paperless._patch_document_with_retry(
                 client, 5, {"storage_path": 7}, max_tries=3
             )
         assert result is None
+        assert reason == "retries_exhausted"
         assert client.patch.await_count == 3
 
     @pytest.mark.asyncio
@@ -2309,10 +2314,11 @@ class TestPatchDocumentWithRetry:
         )
 
         with patch("renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()):
-            result = await paperless._patch_document_with_retry(
+            result, reason = await paperless._patch_document_with_retry(
                 client, 5, {"storage_path": 7}, max_tries=3
             )
         assert result == {"id": 5}
+        assert reason is None
         assert client.patch.await_count == 2
 
 
@@ -2462,19 +2468,24 @@ class TestUploadDocumentExtendedFields:
 
         client = AsyncMock()
         client.post = AsyncMock(return_value=_mk_post_resp("task-slow"))
-        client.get = AsyncMock(
-            side_effect=[
-                _mk_taxonomy_resp([]),
-                _mk_taxonomy_resp([]),
-                _mk_taxonomy_resp([{"id": 99, "path": "/x"}]),
-                _mk_taxonomy_resp([]),
-                # Now the polling path: keep returning PENDING
-                _mk_task_poll_resp(None),
-                _mk_task_poll_resp(None),
-                _mk_task_poll_resp(None),
-                _mk_task_poll_resp(None),
-            ]
-        )
+
+        # Function-based side_effect so poll requests always return PENDING,
+        # however many iterations the loop makes before the deadline. A
+        # fixed-length list would raise StopAsyncIteration on the Nth+1 call.
+        taxonomy_responses = [
+            _mk_taxonomy_resp([]),
+            _mk_taxonomy_resp([]),
+            _mk_taxonomy_resp([{"id": 99, "path": "/x"}]),
+            _mk_taxonomy_resp([]),
+        ]
+        taxonomy_iter = iter(taxonomy_responses)
+
+        async def _get(url, **kwargs):
+            if "/api/tasks/" in url:
+                return _mk_task_poll_resp(None)  # forever PENDING
+            return next(taxonomy_iter)
+
+        client.get = _get
         client.patch = AsyncMock()
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
@@ -2536,7 +2547,139 @@ class TestUploadDocumentExtendedFields:
         assert result["document_id"] == 555  # upload DID succeed
         assert result["post_upload_patch"] == "retries_exhausted"
         assert "555" in result["patch_error"]
+        assert "transient errors" in result["patch_error"]
         assert client.patch.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_patch_4xx_surfaces_client_error_not_retries(self):
+        """A 4xx on the PATCH (e.g. a storage_path id that was valid at
+        cache time but got deleted between the fetch and the PATCH) must
+        surface as ``client_error`` — NOT ``retries_exhausted``. Different
+        recovery path: client_error means retrying won't help."""
+        import base64
+        import httpx as _httpx
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-z"))
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([{"id": 1, "path": "/x"}]),
+                _mk_taxonomy_resp([]),
+                _mk_task_poll_resp(777),
+            ]
+        )
+
+        # PATCH returns 422 (validation error)
+        mock_422 = MagicMock()
+        mock_422.status_code = 422
+        mock_422.request = MagicMock()
+
+        def _raise_422():
+            raise _httpx.HTTPStatusError(
+                "422", request=mock_422.request, response=mock_422
+            )
+        mock_422.raise_for_status = _raise_422
+        client.patch = AsyncMock(return_value=mock_422)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            with patch(
+                "renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()
+            ):
+                result = await paperless.upload_document(
+                    title="T",
+                    file_content_base64=b64,
+                    filename="t.pdf",
+                    storage_path="/x",
+                )
+
+        assert result["document_id"] == 777
+        assert result["post_upload_patch"] == "client_error"
+        # 4xx bails on first attempt — retries_exhausted wording must NOT
+        # appear in the error message for this path.
+        assert "retries" not in result["patch_error"].lower()
+        assert "manual" in result["patch_error"].lower() or "manually" in result["patch_error"].lower()
+        assert client.patch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_custom_fields_list_does_not_trigger_patch(self):
+        """Regression guard: passing custom_fields=[] must NOT trigger a
+        PATCH. Sending {"custom_fields": []} to Paperless WIPES any
+        existing custom fields on the document — destructive and almost
+        certainly not what the caller wanted when they passed an empty
+        list. Treat [] same as None (no-op for the PATCH trigger)."""
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-w"))
+        client.get = AsyncMock()  # should NEVER be called
+        client.patch = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.upload_document(
+                title="T",
+                file_content_base64=b64,
+                filename="t.pdf",
+                custom_fields=[],  # empty list — must be no-op
+            )
+
+        # Upload succeeded, but no PATCH was issued.
+        assert result["task_id"] == "task-w"
+        assert "post_upload_patch" not in result  # no patch attempted
+        assert client.patch.await_count == 0
+        assert client.get.await_count == 0  # no polling, no cache warm-up
+
+    @pytest.mark.asyncio
+    async def test_nonempty_custom_fields_does_trigger_patch(self):
+        """Sibling of the empty-list test: a real custom_fields value
+        SHOULD trigger the full PATCH path."""
+        import base64
+        b64 = base64.b64encode(b"%PDF-1.4 " + b"x" * 200).decode()
+
+        custom_fields = [{"field": 1, "value": "invoice-2026-01"}]
+
+        client = AsyncMock()
+        client.post = AsyncMock(return_value=_mk_post_resp("task-cf"))
+        client.get = AsyncMock(
+            side_effect=[
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_taxonomy_resp([]),
+                _mk_task_poll_resp(888),
+            ]
+        )
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.raise_for_status = MagicMock()
+        patch_resp.json.return_value = {"id": 888, "custom_fields": custom_fields}
+        client.patch = AsyncMock(return_value=patch_resp)
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            with patch(
+                "renfield_mcp_paperless.server.asyncio.sleep", AsyncMock()
+            ):
+                result = await paperless.upload_document(
+                    title="T",
+                    file_content_base64=b64,
+                    filename="t.pdf",
+                    custom_fields=custom_fields,
+                )
+
+        assert result["post_upload_patch"] == "success"
+        assert client.patch.await_count == 1
+        # Verify the PATCH carried the custom_fields payload.
+        patch_call = client.patch.await_args
+        assert patch_call.kwargs["json"]["custom_fields"] == custom_fields
 
 
 # ── create_correspondent ─────────────────────────────────────────

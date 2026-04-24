@@ -737,15 +737,6 @@ async def upload_document(
             )
         }
 
-    data: dict[str, str] = {"title": title}
-    if correspondent:
-        data["correspondent"] = correspondent
-    if document_type:
-        data["document_type"] = document_type
-    if tags:
-        for i, tag in enumerate(tags):
-            data[f"tags[{i}]"] = tag
-
     # Paperless rejects application/octet-stream (httpx's default when the
     # content-type tuple element is omitted). Derive the real MIME from the
     # filename extension so the multipart upload carries a type Paperless'
@@ -765,13 +756,66 @@ async def upload_document(
     )
 
     async with httpx.AsyncClient(timeout=60.0) as client:
+        # Paperless's post_document endpoint uses DRF PrimaryKeyRelatedField
+        # for correspondent / document_type / tags — sending raw name strings
+        # produces HTTP 400 "Incorrect type. Expected pk value, received str."
+        # Resolve name → ID up-front against the cached taxonomy the same way
+        # the post-upload PATCH path does for storage_path / custom_fields.
+        data: dict[str, str | int] = {"title": title}
+        needs_caches = bool(correspondent or document_type or tags)
+        if needs_caches:
+            await _ensure_caches(client)
+
+        if correspondent:
+            cid = _resolve_name_to_id(correspondent, _correspondent_cache or {})
+            if cid is None:
+                return {
+                    "error": (
+                        f"Unknown correspondent: {correspondent!r}. Create it "
+                        "first via create_correspondent, or omit the field."
+                    ),
+                }
+            data["correspondent"] = cid
+        if document_type:
+            dtid = _resolve_name_to_id(document_type, _document_type_cache or {})
+            if dtid is None:
+                return {
+                    "error": (
+                        f"Unknown document_type: {document_type!r}. Create it "
+                        "first via create_document_type, or omit the field."
+                    ),
+                }
+            data["document_type"] = dtid
+        if tags:
+            tag_ids = _resolve_tags_to_ids(tags, _tag_cache or {})
+            unresolved = [t for t in tags if _resolve_name_to_id(t, _tag_cache or {}) is None]
+            if unresolved:
+                return {
+                    "error": (
+                        f"Unknown tag(s): {unresolved!r}. Create them first "
+                        "via create_tag, or omit them from the upload."
+                    ),
+                }
+            for i, tid in enumerate(tag_ids):
+                data[f"tags[{i}]"] = tid
+
         resp = await client.post(
             f"{PAPERLESS_API_URL}/api/documents/post_document/",
             headers=_headers(),
             files={"document": (filename, file_bytes, content_type)},
             data=data,
         )
-        resp.raise_for_status()
+        # Surface Paperless's own error body on 4xx/5xx instead of the
+        # generic httpx message — the original bug report hit a plain
+        # "Client error '400 Bad Request'" that hid the real reason
+        # ("Incorrect type. Expected pk value, received str.").
+        if resp.status_code >= 400:
+            return {
+                "error": (
+                    f"Paperless rejected the upload with HTTP {resp.status_code}: "
+                    f"{resp.text.strip() or '(empty response body)'}"
+                ),
+            }
 
         # Paperless returns the task ID as plain text (sometimes quoted)
         task_id = resp.text.strip().strip('"')

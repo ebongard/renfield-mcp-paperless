@@ -973,6 +973,118 @@ class TestUploadDocument:
         )
         assert "error" in result
 
+    @pytest.mark.asyncio
+    async def test_upload_resolves_correspondent_name_to_id(self):
+        """Regression for the 2026-04-24 bug — Paperless post_document expects
+        an integer pk for correspondent/document_type/tags. The MCP server must
+        resolve the user-friendly name against the cached taxonomy before
+        sending, otherwise Paperless returns HTTP 400
+        "Incorrect type. Expected pk value, received str."."""
+        import base64
+        file_bytes = b"%PDF-1.4 " + b"x" * 200
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "token"
+        paperless._correspondent_cache = {42: "Telekom Deutschland GmbH"}
+        paperless._document_type_cache = {7: "Rechnung"}
+        paperless._tag_cache = {3: "privat", 4: "steuer"}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '"task-uuid-123"'
+
+        captured_data: dict = {}
+
+        async def capture_post(url, **kwargs):
+            captured_data.update(kwargs.get("data", {}))
+            return mock_resp
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = capture_post
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.upload_document(
+                title="Test Invoice",
+                file_content_base64=b64,
+                filename="invoice.pdf",
+                correspondent="Telekom",  # substring match → id=42
+                document_type="Rechnung",  # exact match → id=7
+                tags=["privat", "steuer"],
+            )
+
+        assert "error" not in result
+        # The posted form data must carry integer IDs, not the raw names.
+        assert captured_data["correspondent"] == 42
+        assert captured_data["document_type"] == 7
+        assert captured_data["tags[0]"] == 3
+        assert captured_data["tags[1]"] == 4
+
+    @pytest.mark.asyncio
+    async def test_upload_fails_fast_on_unknown_correspondent(self):
+        import base64
+        file_bytes = b"%PDF-1.4 " + b"x" * 200
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "token"
+        paperless._correspondent_cache = {42: "Telekom"}
+        paperless._document_type_cache = {}
+        paperless._tag_cache = {}
+        paperless._storage_path_cache = {}
+
+        result = await paperless.upload_document(
+            title="Test",
+            file_content_base64=b64,
+            correspondent="DoesNotExist",
+        )
+
+        assert "error" in result
+        assert "Unknown correspondent" in result["error"]
+        assert "DoesNotExist" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_upload_surfaces_paperless_error_body_on_400(self):
+        """Regression for diagnostics — when Paperless returns 4xx the MCP
+        server must propagate the response body instead of swallowing it via
+        resp.raise_for_status(). Without this, the user only sees
+        "Client error '400 Bad Request'" and can't tell what Paperless
+        actually complained about."""
+        import base64
+        file_bytes = b"%PDF-1.4 " + b"x" * 200
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "token"
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._tag_cache = {}
+        paperless._storage_path_cache = {}
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = '{"document":["The submitted data was not a file."]}'
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = AsyncMock(return_value=mock_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.upload_document(
+                title="Test",
+                file_content_base64=b64,
+            )
+
+        assert "error" in result
+        assert "HTTP 400" in result["error"]
+        assert "The submitted data was not a file." in result["error"]
+
 
 # ── Response Size ────────────────────────────────────────────────
 

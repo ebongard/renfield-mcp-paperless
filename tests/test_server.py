@@ -950,6 +950,46 @@ class TestUploadDocument:
         assert result["filename"] == "invoice.pdf"
 
     @pytest.mark.asyncio
+    async def test_upload_wait_for_consume_false_returns_submitted_without_polling(self):
+        """wait_for_consume=False: with post-consume fields (custom_fields), the
+        tool POSTs and returns immediately with status=submitted + deferred_patch,
+        WITHOUT polling the consume task — so the caller can apply the metadata
+        async via update_document (avoids blocking on Paperless's consume queue)."""
+        import base64
+
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "tok"
+        file_bytes = b"%PDF-1.4 " + b"x" * 200
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '"task-async-9"'
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.post = AsyncMock(return_value=mock_resp)
+            instance.get = AsyncMock()  # must NOT be called (no consume poll)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.upload_document(
+                title="Async Invoice",
+                file_content_base64=b64,
+                filename="invoice.pdf",
+                custom_fields=[{"field": 1, "value": "X"}],
+                wait_for_consume=False,
+            )
+
+        assert result["task_id"] == "task-async-9"
+        assert result["status"] == "submitted"
+        assert result["deferred_patch"]["custom_fields"] == [{"field": 1, "value": "X"}]
+        assert "document_id" not in result  # never polled for it
+        instance.get.assert_not_called()  # no consume-task polling
+
+    @pytest.mark.asyncio
     async def test_upload_missing_url(self):
         paperless.PAPERLESS_API_URL = ""
         result = await paperless.upload_document(
@@ -1952,6 +1992,7 @@ class TestResolveDocumentStoragePath:
 def _make_mock_upload_client(task_id: str = "abc-123"):
     """Mock httpx.AsyncClient whose POST returns a Paperless task id."""
     post_resp = MagicMock()
+    post_resp.status_code = 200  # upload_document checks `status_code >= 400` first
     post_resp.text = f'"{task_id}"'
     post_resp.raise_for_status = MagicMock()
 

@@ -671,6 +671,7 @@ async def upload_document(
     storage_path: str | None = None,
     created_date: str | None = None,
     custom_fields: list[dict] | None = None,
+    wait_for_consume: bool = True,
 ) -> dict:
     """Upload a document to Paperless-NGX for OCR and archiving.
 
@@ -701,6 +702,14 @@ async def upload_document(
         storage_path: Optional storage path name. Applied via post-upload PATCH.
         created_date: Optional document creation date (YYYY-MM-DD). Applied via PATCH.
         custom_fields: Optional list of ``[{field: id, value: ...}]``. Applied via PATCH.
+        wait_for_consume: When True (default), block to apply the post-consume
+            PATCH (storage_path/created_date/custom_fields) before returning —
+            the historical behaviour. When False, return immediately after the
+            POST with ``status="submitted"`` and a ``deferred_patch`` dict; the
+            caller polls the consume task itself and applies those fields via
+            ``update_document`` once the document id exists. Use False to avoid
+            blocking the tool call on Paperless's consume queue, which can
+            exceed the caller's tool-call timeout for large / OCR-heavy docs.
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -827,6 +836,21 @@ async def upload_document(
         }
 
         if not needs_patch:
+            return result
+
+        if not wait_for_consume:
+            # Submit-only: hand the post-consume metadata back to the caller to
+            # apply asynchronously (via update_document once the consume task
+            # produces a document id). Avoids blocking this tool call on
+            # Paperless's consume queue. Field values are returned by NAME (as
+            # received) — update_document resolves them the same way the
+            # synchronous PATCH path does.
+            result["status"] = "submitted"
+            result["deferred_patch"] = {
+                "storage_path": storage_path,
+                "created_date": created_date,
+                "custom_fields": custom_fields,
+            }
             return result
 
         # Phase 2: poll the task endpoint to get the document id, then

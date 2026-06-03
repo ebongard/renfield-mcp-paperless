@@ -1833,6 +1833,77 @@ class TestUpdateDocumentCustomFields:
         assert call_kwargs.kwargs["json"] == {"custom_fields": custom}
 
 
+# ── update_document content ──────────────────────────────────────
+
+
+class TestUpdateDocumentContent:
+    @pytest.mark.asyncio
+    async def test_content_sent_in_patch(self):
+        """Passing content writes the OCR text back via the PATCH body.
+
+        Used by Renfield's audit re-OCR: re-OCR a document locally with a
+        better engine, then push the cleaned text into Paperless's searchable
+        content field.
+        """
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42,
+            "title": "Doc",
+            "correspondent": None,
+            "document_type": None,
+            "tags": [],
+            "storage_path": None,
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, content="Sauberer OCR Text.")
+
+        assert result["id"] == 42
+        call_kwargs = instance.patch.call_args
+        assert call_kwargs.kwargs["json"] == {"content": "Sauberer OCR Text."}
+
+    @pytest.mark.asyncio
+    async def test_content_combines_with_metadata(self):
+        """content and metadata fields go into the same PATCH body."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        patch_resp = MagicMock()
+        patch_resp.status_code = 200
+        patch_resp.json.return_value = {
+            "id": 42, "title": "New", "correspondent": None,
+            "document_type": None, "tags": [], "storage_path": None,
+        }
+        patch_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.patch = AsyncMock(return_value=patch_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.update_document(42, title="New", content="OCR")
+
+        assert result["id"] == 42
+        assert instance.patch.call_args.kwargs["json"] == {"title": "New", "content": "OCR"}
+
+
 # ── list_custom_fields ───────────────────────────────────────────
 
 

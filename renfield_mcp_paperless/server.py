@@ -986,6 +986,7 @@ async def update_document(
     created_date: str | None = None,
     storage_path: str | None = None,
     custom_fields: list[dict] | None = None,
+    content: str | None = None,
 ) -> dict:
     """Update metadata of a document in Paperless-NGX.
 
@@ -1002,6 +1003,9 @@ async def update_document(
         created_date: Document creation date (YYYY-MM-DD)
         storage_path: Storage path name (must exist in Paperless)
         custom_fields: List of custom field dicts [{field: id, value: ...}]
+        content: Replace the document's OCR/text content. Use to write back
+            text re-OCR'd by a better engine. Note: this updates the searchable
+            content only; the stored archive PDF is not regenerated.
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -1046,6 +1050,9 @@ async def update_document(
 
         if custom_fields is not None:
             patch_data["custom_fields"] = custom_fields
+
+        if content is not None:
+            patch_data["content"] = content
 
         if not patch_data:
             return {"error": "No fields to update"}

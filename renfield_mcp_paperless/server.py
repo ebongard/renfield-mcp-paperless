@@ -924,7 +924,7 @@ async def upload_document(
 
 
 @mcp.tool()
-async def get_document(document_id: int) -> dict:
+async def get_document(document_id: int, include_content: bool = True) -> dict:
     """Get full details of a single document from Paperless-NGX by ID.
 
     Returns the complete document including full OCR text content,
@@ -933,6 +933,9 @@ async def get_document(document_id: int) -> dict:
 
     Args:
         document_id: Paperless document ID
+        include_content: When False, omit the (often large) OCR `content`
+            field — callers that only need metadata avoid the response being
+            truncated by the client's size cap. `content` is then None.
     """
     if not PAPERLESS_API_URL:
         return {"error": "PAPERLESS_API_URL not configured"}
@@ -963,7 +966,7 @@ async def get_document(document_id: int) -> dict:
     return {
         "id": doc["id"],
         "title": doc.get("title", ""),
-        "content": doc.get("content"),
+        "content": doc.get("content") if include_content else None,
         "created": doc.get("created"),
         "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,

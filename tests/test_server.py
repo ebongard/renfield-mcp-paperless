@@ -1697,6 +1697,40 @@ class TestGetDocumentExtendedFields:
         assert result["page_count"] is None
         assert result["added"] is None
 
+    @pytest.mark.asyncio
+    async def test_include_content_false_omits_ocr(self):
+        """include_content=False omits the OCR content (metadata-only) so the
+        response can't be size-truncated; metadata fields still present."""
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        doc_resp = MagicMock()
+        doc_resp.status_code = 200
+        doc_resp.json.return_value = {
+            "id": 7, "title": "Big OCR Doc",
+            "content": "x" * 50000,  # large OCR text that would blow the cap
+            "created": "2030-01-01", "correspondent": None,
+            "document_type": None, "tags": [], "original_file_name": "big.pdf",
+        }
+        doc_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.get = AsyncMock(return_value=doc_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            full = await paperless.get_document(7)
+            meta = await paperless.get_document(7, include_content=False)
+
+        assert full["content"] == "x" * 50000      # default keeps content
+        assert meta["content"] is None             # omitted
+        assert meta["title"] == "Big OCR Doc"       # metadata still present
+        assert meta["original_file_name"] == "big.pdf"
+
 
 # ── update_document created_date ─────────────────────────────────
 

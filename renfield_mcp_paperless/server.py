@@ -516,25 +516,45 @@ async def download_document(document_id: int) -> dict:
 _UPLOAD_TASK_POLL_TIMEOUT_S = 30.0
 _UPLOAD_TASK_POLL_INTERVAL_S = 1.0
 
+# Paperless-ngx rejects a duplicate document ASYNCHRONOUSLY inside the consume
+# task: the task ends in status=FAILURE with a ``result`` string, with no
+# structured "duplicate" field. The canonical message is
+# ``"<file>: Not consuming <file>: It is a duplicate of <title> (#<pk>)"``.
+# We pin the SPECIFIC phrase so a duplicate reads as a TERMINAL SUCCESS to the
+# caller (the document is already in Paperless — nothing to retry). Matched
+# case-insensitively. Kept narrow on purpose: a bare "duplicate of" can appear
+# in unrelated failure text, and misreading a genuine failure as a duplicate
+# would silently swallow it — a miss (treated as a normal failure) is the safe
+# direction, a false positive is not.
+_PAPERLESS_DUPLICATE_MARKERS = ("it is a duplicate",)
 
-async def _poll_task_for_document_id(
+
+def _is_duplicate_failure(result_text) -> bool:
+    """True when a consume FAILURE ``result`` is Paperless's duplicate rejection.
+    Non-string / empty results (Paperless occasionally returns null) are not
+    duplicates — and must not crash on ``.lower()``."""
+    if not isinstance(result_text, str) or not result_text:
+        return False
+    low = result_text.lower()
+    return any(marker in low for marker in _PAPERLESS_DUPLICATE_MARKERS)
+
+
+async def _poll_task(
     client: httpx.AsyncClient, task_id: str, timeout_s: float | None = None
-) -> int | None:
-    """Poll Paperless's task endpoint until the consume task produces a
-    document id.
+) -> dict:
+    """Poll Paperless's task endpoint until the consume task reaches a terminal
+    state, and report the outcome structurally.
 
-    Returns the document id on success, or None if:
-      - the task fails in Paperless (FAILURE status),
-      - the timeout elapses before the task completes,
-      - the response shape is unexpected.
+    Returns a dict with ``status`` one of:
+      - ``"success"``   — consumed; ``document_id`` is the new Paperless id.
+      - ``"duplicate"`` — Paperless rejected it as a duplicate (already filed);
+                          terminal SUCCESS for our purposes (nothing to retry).
+      - ``"failure"``   — consume failed for a non-duplicate reason; ``detail``
+                          carries Paperless's failure result string.
+      - ``"pending"``   — the timeout elapsed before the task became terminal.
 
-    ``timeout_s`` defaults to ``_UPLOAD_TASK_POLL_TIMEOUT_S`` when omitted.
-    The default resolves at call time (not as a default-arg evaluation)
-    so tests can patch the module constant for shorter runs.
-
-    Callers should treat ``None`` as "document is queued, PATCH cannot run
-    now — surface to user and leave the document without post-upload
-    metadata."
+    ``timeout_s`` defaults to ``_UPLOAD_TASK_POLL_TIMEOUT_S`` when omitted (the
+    default resolves at call time so tests can patch the module constant).
     """
     import json as _json
     if timeout_s is None:
@@ -559,19 +579,26 @@ async def _poll_task_for_document_id(
                 if status == "SUCCESS":
                     related = task.get("related_document")
                     if related is not None:
-                        return int(related)
+                        return {"status": "success", "document_id": int(related), "detail": None}
                     logger.warning(
                         "Task %s completed SUCCESS but has no related_document",
                         task_id,
                     )
-                    return None
+                    return {"status": "success", "document_id": None, "detail": None}
                 if status == "FAILURE":
+                    result_text = task.get("result")
+                    is_dup = _is_duplicate_failure(result_text)
                     logger.warning(
-                        "Task %s failed in Paperless: %s",
+                        "Task %s failed in Paperless (%s): %s",
                         task_id,
-                        task.get("result", "no details"),
+                        "duplicate" if is_dup else "non-duplicate",
+                        result_text or "no details",
                     )
-                    return None
+                    return {
+                        "status": "duplicate" if is_dup else "failure",
+                        "document_id": None,
+                        "detail": result_text,
+                    }
         except (httpx.HTTPError, _json.JSONDecodeError, ValueError) as e:
             # Narrow catch so programming errors (AttributeError, KeyError in
             # our own code) don't get silently swallowed into a 30 s hang.
@@ -580,12 +607,18 @@ async def _poll_task_for_document_id(
 
         await asyncio.sleep(_UPLOAD_TASK_POLL_INTERVAL_S)
 
-    logger.warning(
-        "Task %s did not complete within %.1fs; skipping post-upload PATCH",
-        task_id,
-        timeout_s,
-    )
-    return None
+    logger.warning("Task %s did not complete within %.1fs", task_id, timeout_s)
+    return {"status": "pending", "document_id": None, "detail": "timeout"}
+
+
+async def _poll_task_for_document_id(
+    client: httpx.AsyncClient, task_id: str, timeout_s: float | None = None
+) -> int | None:
+    """Back-compat thin wrapper over :func:`_poll_task` for the upload PATCH
+    path: returns the document id on success, else None (duplicate / failure /
+    timeout all map to None — "PATCH cannot run now")."""
+    outcome = await _poll_task(client, task_id, timeout_s)
+    return outcome.get("document_id")
 
 
 async def _patch_document_with_retry(
@@ -921,6 +954,35 @@ async def upload_document(
             )
 
     return result
+
+
+@mcp.tool()
+async def await_consume_result(task_id: str, timeout_s: float | None = None) -> dict:
+    """Poll a Paperless consume task to a terminal state and report the outcome.
+
+    Use after ``upload_document(wait_for_consume=False)`` to learn whether the
+    document was filed, was rejected as a DUPLICATE (already in Paperless),
+    failed to consume, or is still pending — Paperless decides this
+    asynchronously, so the upload call returns before the verdict is known.
+
+    Returns ``{"status": ..., "document_id": int|None, "detail": str|None}``
+    where ``status`` is one of:
+      - ``"success"``   — consumed; ``document_id`` is the new Paperless id.
+      - ``"duplicate"`` — already filed (terminal success; nothing to retry).
+      - ``"failure"``   — consume failed (non-duplicate); ``detail`` has why.
+      - ``"pending"``   — still running after ``timeout_s`` (poll again later).
+
+    ``timeout_s`` defaults to ~30 s. Errors (config / unreachable Paperless)
+    surface as ``{"error": ...}``.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+    if not task_id:
+        return {"error": "task_id is required"}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        return await _poll_task(client, task_id, timeout_s)
 
 
 @mcp.tool()

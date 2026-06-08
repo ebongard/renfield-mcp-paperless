@@ -3356,3 +3356,121 @@ class TestListTags:
         assert paperless._correspondent_cache == {1: "A"}
         assert paperless._document_type_cache == {2: "B"}
         assert paperless._storage_path_cache == {3: "/x"}
+
+
+# ── consume-task polling + duplicate detection (folder-ingest T5/T10) ──────
+
+
+def _task_poll_client(task_obj):
+    """A mock httpx client whose GET on /api/tasks/ returns [task_obj] (or [] if
+    None) with a passing raise_for_status."""
+    resp = MagicMock()
+    resp.json.return_value = [task_obj] if task_obj is not None else []
+    resp.raise_for_status = MagicMock()
+    client = AsyncMock()
+    client.get = AsyncMock(return_value=resp)
+    return client
+
+
+class TestIsDuplicateFailure:
+    def test_canonical_marker(self):
+        assert paperless._is_duplicate_failure(
+            "invoice.pdf: Not consuming invoice.pdf: It is a duplicate of Rechnung (#7)"
+        )
+
+    def test_case_insensitive(self):
+        assert paperless._is_duplicate_failure("IT IS A DUPLICATE OF X")
+
+    def test_non_duplicate_failure(self):
+        assert not paperless._is_duplicate_failure("OSError: cannot parse PDF")
+
+    def test_bare_duplicate_of_is_not_matched(self):
+        # Narrow marker: a bare "duplicate of" in unrelated failure text must
+        # NOT be read as a duplicate (would swallow a genuine failure).
+        assert not paperless._is_duplicate_failure("config has a duplicate of field x")
+
+    def test_none_and_empty(self):
+        assert not paperless._is_duplicate_failure(None)
+        assert not paperless._is_duplicate_failure("")
+
+    def test_non_string_result_is_safe(self):
+        # Paperless occasionally returns a non-string result — must not crash.
+        assert not paperless._is_duplicate_failure(123)
+        assert not paperless._is_duplicate_failure({"err": "x"})
+
+
+class TestPollTaskOutcome:
+    @pytest.mark.asyncio
+    async def test_success_returns_document_id(self):
+        client = _task_poll_client({"status": "SUCCESS", "related_document": 42})
+        out = await paperless._poll_task(client, "t1")
+        assert out == {"status": "success", "document_id": 42, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_success_without_related_document(self):
+        client = _task_poll_client({"status": "SUCCESS", "related_document": None})
+        out = await paperless._poll_task(client, "t1")
+        assert out["status"] == "success"
+        assert out["document_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_duplicate_failure_is_terminal_success(self):
+        client = _task_poll_client(
+            {"status": "FAILURE",
+             "result": "x.pdf: Not consuming x.pdf: It is a duplicate of R (#7)"}
+        )
+        out = await paperless._poll_task(client, "t1")
+        assert out["status"] == "duplicate"
+        assert out["document_id"] is None
+        assert "duplicate" in out["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_non_duplicate_failure(self):
+        client = _task_poll_client({"status": "FAILURE", "result": "cannot parse PDF"})
+        out = await paperless._poll_task(client, "t1")
+        assert out["status"] == "failure"
+        assert out["detail"] == "cannot parse PDF"
+
+    @pytest.mark.asyncio
+    async def test_pending_on_timeout(self, monkeypatch):
+        monkeypatch.setattr(paperless, "_UPLOAD_TASK_POLL_INTERVAL_S", 0.001)
+        client = _task_poll_client({"status": "STARTED"})  # never terminal
+        out = await paperless._poll_task(client, "t1", timeout_s=0.01)
+        assert out["status"] == "pending"
+
+
+class TestPollTaskBackCompat:
+    @pytest.mark.asyncio
+    async def test_wrapper_returns_doc_id_on_success(self):
+        client = _task_poll_client({"status": "SUCCESS", "related_document": 9})
+        assert await paperless._poll_task_for_document_id(client, "t1") == 9
+
+    @pytest.mark.asyncio
+    async def test_wrapper_none_on_duplicate(self):
+        client = _task_poll_client(
+            {"status": "FAILURE", "result": "It is a duplicate of X"}
+        )
+        assert await paperless._poll_task_for_document_id(client, "t1") is None
+
+
+class TestAwaitConsumeResult:
+    @pytest.mark.asyncio
+    async def test_missing_url_errors(self, monkeypatch):
+        monkeypatch.setattr(paperless, "PAPERLESS_API_URL", "")
+        out = await paperless.await_consume_result("t1")
+        assert "error" in out
+
+    @pytest.mark.asyncio
+    async def test_missing_task_id_errors(self):
+        out = await paperless.await_consume_result("")
+        assert "error" in out
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_poll_task(self, monkeypatch):
+        monkeypatch.setattr(
+            paperless,
+            "_poll_task",
+            AsyncMock(return_value={"status": "duplicate", "document_id": None, "detail": "dup"}),
+        )
+        out = await paperless.await_consume_result("t1")
+        assert out["status"] == "duplicate"

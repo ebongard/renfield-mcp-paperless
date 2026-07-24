@@ -575,7 +575,13 @@ async def _poll_task(
             tasks = data if isinstance(data, list) else data.get("results", [])
             if tasks:
                 task = tasks[0]
-                status = task.get("status")
+                # Normalise case: Paperless returned UPPER-CASE task status
+                # ("SUCCESS"/"FAILURE") historically but switched to lower-case
+                # ("success"/"failure") in a later version. Comparing case-sensitively
+                # against "SUCCESS" then NEVER matched → the poll looped to timeout →
+                # the doc never settled → re-upload loop + duplicates (2026-07). Upper()
+                # here matches both spellings.
+                status = (task.get("status") or "").upper()
                 if status == "SUCCESS":
                     related = task.get("related_document")
                     if related is not None:

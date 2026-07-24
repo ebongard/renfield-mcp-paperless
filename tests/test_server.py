@@ -3414,6 +3414,24 @@ class TestPollTaskOutcome:
         assert out["document_id"] is None
 
     @pytest.mark.asyncio
+    async def test_lowercase_success_is_terminal(self):
+        # Regression (2026-07): a Paperless version switched task status to
+        # lower-case ("success"/"failure"). Comparing case-sensitively against
+        # "SUCCESS" never matched → the poll looped to timeout → the doc never
+        # settled → re-upload loop + duplicates. Must treat lower-case as terminal.
+        client = _task_poll_client({"status": "success", "related_document": 42})
+        out = await paperless._poll_task(client, "t1")
+        assert out == {"status": "success", "document_id": 42, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_lowercase_failure_is_terminal(self):
+        client = _task_poll_client(
+            {"status": "failure", "result": "Not consuming: it is a duplicate"}
+        )
+        out = await paperless._poll_task(client, "t1")
+        assert out["status"] in ("duplicate", "failure")  # terminal, not an endless poll
+
+    @pytest.mark.asyncio
     async def test_duplicate_failure_is_terminal_success(self):
         client = _task_poll_client(
             {"status": "FAILURE",

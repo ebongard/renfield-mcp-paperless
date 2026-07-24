@@ -1617,6 +1617,66 @@ class TestReprocessDocument:
         assert call_kwargs["json"]["method"] == "reprocess"
 
 
+# ── delete_document ─────────────────────────────────────────────
+
+
+class TestDeleteDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.delete_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.delete_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_delete(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "tok"
+        del_resp = MagicMock()
+        del_resp.status_code = 204
+        del_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.delete = AsyncMock(return_value=del_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.delete_document(42)
+
+        assert result == {"deleted": True, "id": 42}
+        # Verify it hit the document detail endpoint with DELETE
+        call_args = instance.delete.call_args
+        assert call_args.args[0].endswith("/api/documents/42/")
+
+    @pytest.mark.asyncio
+    async def test_not_found_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "tok"
+        del_resp = MagicMock()
+        del_resp.status_code = 404
+        del_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.delete = AsyncMock(return_value=del_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.delete_document(9999)
+
+        assert "error" in result
+        assert "9999" in result["error"]
+
+
 # ── get_document extended fields ─────────────────────────────────
 
 

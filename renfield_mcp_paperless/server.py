@@ -575,7 +575,13 @@ async def _poll_task(
             tasks = data if isinstance(data, list) else data.get("results", [])
             if tasks:
                 task = tasks[0]
-                status = task.get("status")
+                # Normalise case: Paperless returned UPPER-CASE task status
+                # ("SUCCESS"/"FAILURE") historically but switched to lower-case
+                # ("success"/"failure") in a later version. Comparing case-sensitively
+                # against "SUCCESS" then NEVER matched → the poll looped to timeout →
+                # the doc never settled → re-upload loop + duplicates (2026-07). Upper()
+                # here matches both spellings.
+                status = (task.get("status") or "").upper()
                 if status == "SUCCESS":
                     related = task.get("related_document")
                     if related is not None:
@@ -1149,6 +1155,39 @@ async def update_document(
         "tags": resolved_tags if resolved_tags else None,
         "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
+
+
+@mcp.tool()
+async def delete_document(document_id: int) -> dict:
+    """Delete a document from Paperless-NGX by ID.
+
+    On Paperless-ngx 2.x this moves the document to the **trash** (a soft
+    delete, recoverable for the instance's trash-retention window), not an
+    immediate hard delete — so an over-eager de-duplication can still be
+    undone from the Paperless UI. Use only after you have confirmed the
+    document is a true duplicate (identical content) of one you are keeping.
+
+    Args:
+        document_id: Paperless document ID to delete.
+
+    Returns ``{"deleted": true, "id": document_id}`` on success (HTTP 204),
+    ``{"error": ...}`` on a missing id (404) or transport failure.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.delete(
+            f"{PAPERLESS_API_URL}/api/documents/{document_id}/",
+            headers=_headers(),
+        )
+        if resp.status_code == 404:
+            return {"error": f"Document {document_id} not found"}
+        resp.raise_for_status()
+
+    return {"deleted": True, "id": document_id}
 
 
 @mcp.tool()

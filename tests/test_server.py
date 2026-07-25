@@ -1617,6 +1617,66 @@ class TestReprocessDocument:
         assert call_kwargs["json"]["method"] == "reprocess"
 
 
+# ── delete_document ─────────────────────────────────────────────
+
+
+class TestDeleteDocument:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.delete_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.delete_document(1)
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_successful_delete(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "tok"
+        del_resp = MagicMock()
+        del_resp.status_code = 204
+        del_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.delete = AsyncMock(return_value=del_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.delete_document(42)
+
+        assert result == {"deleted": True, "id": 42}
+        # Verify it hit the document detail endpoint with DELETE
+        call_args = instance.delete.call_args
+        assert call_args.args[0].endswith("/api/documents/42/")
+
+    @pytest.mark.asyncio
+    async def test_not_found_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "tok"
+        del_resp = MagicMock()
+        del_resp.status_code = 404
+        del_resp.raise_for_status = MagicMock()
+
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.delete = AsyncMock(return_value=del_resp)
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = instance
+
+            result = await paperless.delete_document(9999)
+
+        assert "error" in result
+        assert "9999" in result["error"]
+
+
 # ── get_document extended fields ─────────────────────────────────
 
 
@@ -3412,6 +3472,24 @@ class TestPollTaskOutcome:
         out = await paperless._poll_task(client, "t1")
         assert out["status"] == "success"
         assert out["document_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_lowercase_success_is_terminal(self):
+        # Regression (2026-07): a Paperless version switched task status to
+        # lower-case ("success"/"failure"). Comparing case-sensitively against
+        # "SUCCESS" never matched → the poll looped to timeout → the doc never
+        # settled → re-upload loop + duplicates. Must treat lower-case as terminal.
+        client = _task_poll_client({"status": "success", "related_document": 42})
+        out = await paperless._poll_task(client, "t1")
+        assert out == {"status": "success", "document_id": 42, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_lowercase_failure_is_terminal(self):
+        client = _task_poll_client(
+            {"status": "failure", "result": "Not consuming: it is a duplicate"}
+        )
+        out = await paperless._poll_task(client, "t1")
+        assert out["status"] in ("duplicate", "failure")  # terminal, not an endless poll
 
     @pytest.mark.asyncio
     async def test_duplicate_failure_is_terminal_success(self):

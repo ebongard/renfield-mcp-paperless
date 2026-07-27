@@ -354,6 +354,9 @@ def _resolve_document(doc: dict, query: str | None = None) -> dict:
         "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
+        # page_count lets callers establish document identity (e.g. the dedupe tool's
+        # metadata match) straight from search, without a per-document get_document.
+        "page_count": doc.get("page_count"),
         "snippet": snippet,
         "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
@@ -381,7 +384,7 @@ async def search_documents(
 
     Returns a summary (total count, top correspondents/types) followed by
     compact results with id, title, created date, correspondent, document_type,
-    tags, and a content snippet showing WHY the document matched.
+    tags, page_count, and a content snippet showing WHY the document matched.
 
     The summary is always at the top so it survives response truncation.
 
@@ -408,7 +411,7 @@ async def search_documents(
 
         params: dict = {
             "ordering": ordering,
-            "fields": "id,title,created,correspondent,document_type,tags,content",
+            "fields": "id,title,created,correspondent,document_type,tags,content,page_count",
         }
 
         if query:

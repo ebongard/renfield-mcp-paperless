@@ -216,6 +216,7 @@ class TestResolveDocument:
             "document_type": 2,
             "tags": [10, 11],
             "content": "Rechnungsbetrag: 49,99 EUR",
+            "page_count": 3,
         }, query="Rechnung")
 
         assert result["id"] == 1
@@ -224,6 +225,8 @@ class TestResolveDocument:
         assert result["tags"] == ["privat", "steuer"]
         assert result["snippet"] is not None
         assert result["storage_path"] is None
+        # page_count is surfaced from search so callers can dedupe without get_document
+        assert result["page_count"] == 3
 
     def test_null_ids_return_none(self):
         paperless._correspondent_cache = {}
@@ -241,6 +244,7 @@ class TestResolveDocument:
         assert result["tags"] is None
         assert result["snippet"] is None
         assert result["created"] is None
+        assert result["page_count"] is None  # absent in input → None, not KeyError
 
     def test_unknown_id_returns_none(self):
         paperless._correspondent_cache = {1: "Known"}

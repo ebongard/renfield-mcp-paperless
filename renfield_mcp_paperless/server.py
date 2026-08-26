@@ -45,6 +45,9 @@ _tag_cache: Optional[dict[int, str]] = None
 # --- Constants ---
 _MAX_RESULTS_CAP = 500
 _PAGE_SIZE = 100
+# Hard ceiling for the full-archive enumeration (list_all_documents). Far above any
+# realistic corpus; a safety bound so a runaway pagination can't loop forever.
+_FULL_LIST_CEILING = 100000
 
 
 def _headers() -> dict[str, str]:
@@ -364,6 +367,25 @@ def _resolve_document(doc: dict, query: str | None = None) -> dict:
     return result
 
 
+def _resolve_list_document(doc: dict) -> dict:
+    """Compact mapper for list_all_documents — identity fields + checksum, NO
+    content/snippet (kept light for whole-archive enumeration)."""
+    corr_id = doc.get("correspondent")
+    dtype_id = doc.get("document_type")
+    return {
+        "id": doc["id"],
+        # MD5 of the ORIGINAL file (and of the archived PDF) — the exact
+        # byte-identical duplicate signal, independent of any metadata drift.
+        "checksum": doc.get("checksum"),
+        "archive_checksum": doc.get("archive_checksum"),
+        "title": doc.get("title", ""),
+        "created": doc.get("created"),
+        "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
+        "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
+        "page_count": doc.get("page_count"),
+    }
+
+
 # --- MCP Server ---
 mcp = FastMCP("renfield-paperless")
 
@@ -463,6 +485,60 @@ async def search_documents(
 
     return {
         "summary": summary,
+        "results": results,
+    }
+
+
+@mcp.tool()
+async def list_all_documents(include_checksum: bool = True) -> dict:
+    """List EVERY document in Paperless for exact duplicate detection — DB-ordered,
+    index-INDEPENDENT, fully paginated.
+
+    Unlike ``search_documents`` this NEVER uses the full-text search index (no
+    ``query`` is sent) and is NOT capped at 500: it walks the whole archive from
+    the database (``GET /api/documents/`` ordered by id), so a stale or partial
+    search index cannot hide documents. Each result carries the document's
+    ``checksum`` (MD5 of the original file), the exact byte-identical duplicate
+    signal — callers group by it client-side, no per-document fetch needed.
+
+    Returns::
+
+        {"summary": {"total_count", "returned", "truncated"},
+         "results": [{id, checksum, archive_checksum, title, created,
+                      correspondent, document_type, page_count}, ...]}
+
+    ``truncated`` is True only if the archive somehow exceeds the safety ceiling
+    (100k docs) — callers must treat a truncated list as incomplete.
+
+    Args:
+        include_checksum: request checksum/archive_checksum in the field set
+            (default True; set False only if the Paperless version rejects them).
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    fields = "id,title,created,correspondent,document_type,page_count"
+    if include_checksum:
+        fields += ",checksum,archive_checksum"
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        await _ensure_caches(client)
+        # ordering=id → a stable, unique cursor: pagination can never stall the way
+        # date-window sweeping does when >page_size docs share one created date.
+        params: dict = {"ordering": "id", "fields": fields}
+        raw_results, total_count = await _fetch_documents(
+            client, params, _FULL_LIST_CEILING
+        )
+
+    results = [_resolve_list_document(doc) for doc in raw_results]
+    return {
+        "summary": {
+            "total_count": total_count,
+            "returned": len(results),
+            "truncated": len(results) < total_count,
+        },
         "results": results,
     }
 

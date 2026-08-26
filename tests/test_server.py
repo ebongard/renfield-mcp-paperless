@@ -3655,3 +3655,26 @@ class TestListAllDocuments:
             MockClient.return_value = inst
             await paperless.list_all_documents(include_checksum=False)
         assert "checksum" not in inst.captured_params[0].get("fields", "")
+
+    @pytest.mark.asyncio
+    async def test_truncated_when_over_ceiling(self, monkeypatch):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "t"
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+        monkeypatch.setattr(paperless, "_FULL_LIST_CEILING", 1)  # force truncation
+        page = {"count": 2, "next": None, "results": [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01",
+             "correspondent": None, "document_type": None, "page_count": 1},
+            {"id": 2, "checksum": "b", "title": "y", "created": "2030-01-02",
+             "correspondent": None, "document_type": None, "page_count": 1},
+        ]}
+        inst = _make_paginating_client([page])
+        with patch("httpx.AsyncClient") as MockClient:
+            MockClient.return_value = inst
+            result = await paperless.list_all_documents()
+        assert result["summary"]["total_count"] == 2
+        assert result["summary"]["returned"] == 1
+        assert result["summary"]["truncated"] is True

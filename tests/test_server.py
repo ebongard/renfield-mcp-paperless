@@ -3556,3 +3556,102 @@ class TestAwaitConsumeResult:
         )
         out = await paperless.await_consume_result("t1")
         assert out["status"] == "duplicate"
+
+
+# ── list_all_documents ───────────────────────────────────────────
+
+
+def _make_paginating_client(pages):
+    """Serve successive /api/documents/ GETs from `pages`; cache endpoints empty.
+    Records the params of each documents GET on `.captured_params`."""
+    empty = MagicMock()
+    empty.json.return_value = {"results": [], "next": None}
+    empty.raise_for_status = MagicMock()
+    state = {"i": 0}
+    captured: list = []
+
+    async def _get(url, **kwargs):
+        if "/api/documents/" in str(url):
+            captured.append(kwargs.get("params"))
+            i = min(state["i"], len(pages) - 1)
+            state["i"] += 1
+            resp = MagicMock()
+            resp.json.return_value = pages[i]
+            resp.raise_for_status = MagicMock()
+            return resp
+        return empty
+
+    inst = AsyncMock()
+    inst.get = AsyncMock(side_effect=_get)
+    inst.__aenter__ = AsyncMock(return_value=inst)
+    inst.__aexit__ = AsyncMock(return_value=False)
+    inst.captured_params = captured
+    return inst
+
+
+class TestListAllDocuments:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        assert "error" in await paperless.list_all_documents()
+
+    @pytest.mark.asyncio
+    async def test_paginates_all_index_independent_with_checksum(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "t"
+        paperless._correspondent_cache = {1: "ACME"}
+        paperless._document_type_cache = {1: "Rechnung"}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+
+        # 3 docs across 2 pages; ids 1 & 2 share a checksum (byte-identical dup).
+        page1 = {
+            "count": 3,
+            "next": "http://test/api/documents/?page=2",
+            "results": [
+                {"id": 1, "checksum": "aaa", "archive_checksum": "AAA", "title": "x",
+                 "created": "2030-01-01", "correspondent": 1, "document_type": 1, "page_count": 2},
+                {"id": 2, "checksum": "aaa", "archive_checksum": "AAA", "title": "y",
+                 "created": "2030-01-01", "correspondent": 1, "document_type": 1, "page_count": 2},
+            ],
+        }
+        page2 = {
+            "count": 3,
+            "next": None,
+            "results": [
+                {"id": 3, "checksum": "bbb", "archive_checksum": "BBB", "title": "z",
+                 "created": "2030-02-01", "correspondent": 1, "document_type": 1, "page_count": 1},
+            ],
+        }
+        inst = _make_paginating_client([page1, page2])
+        with patch("httpx.AsyncClient") as MockClient:
+            MockClient.return_value = inst
+            result = await paperless.list_all_documents()
+
+        # Walked BOTH pages (past the first) — the >500/day-window stall can't happen.
+        assert [r["id"] for r in result["results"]] == [1, 2, 3]
+        assert result["summary"]["total_count"] == 3
+        assert result["summary"]["returned"] == 3
+        assert result["summary"]["truncated"] is False
+        # Checksum surfaced (the exact byte-identical dup signal).
+        assert result["results"][0]["checksum"] == "aaa"
+        assert result["results"][2]["checksum"] == "bbb"
+        assert result["results"][0]["correspondent"] == "ACME"
+        # Index-INDEPENDENT: never sends a full-text query; stable id-cursor ordering.
+        assert all("query" not in (p or {}) for p in inst.captured_params)
+        assert inst.captured_params[0].get("ordering") == "id"
+        assert "checksum" in inst.captured_params[0].get("fields", "")
+
+    @pytest.mark.asyncio
+    async def test_without_checksum_field(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = "t"
+        paperless._correspondent_cache = {}
+        paperless._document_type_cache = {}
+        paperless._storage_path_cache = {}
+        paperless._tag_cache = {}
+        inst = _make_paginating_client([{"count": 0, "next": None, "results": []}])
+        with patch("httpx.AsyncClient") as MockClient:
+            MockClient.return_value = inst
+            await paperless.list_all_documents(include_checksum=False)
+        assert "checksum" not in inst.captured_params[0].get("fields", "")

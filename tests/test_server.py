@@ -3678,3 +3678,370 @@ class TestListAllDocuments:
         assert result["summary"]["total_count"] == 2
         assert result["summary"]["returned"] == 1
         assert result["summary"]["truncated"] is True
+
+
+# ── dedupe_documents ─────────────────────────────────────────────
+
+
+def _listing(docs, total=None, truncated=False):
+    """Shape a list_all_documents-style response for the dedupe enumeration."""
+    total = len(docs) if total is None else total
+    return {
+        "summary": {"total_count": total, "returned": len(docs), "truncated": truncated},
+        "results": docs,
+    }
+
+
+def _content_fetcher(content_by_id, errors=()):
+    """Async fetch_content stub for _dedupe_build_groups: returns (content, error)."""
+    async def _f(doc_id):
+        if doc_id in errors:
+            return None, True
+        return content_by_id.get(doc_id), False
+    return _f
+
+
+class TestDedupeBuildGroups:
+    @pytest.mark.asyncio
+    async def test_checksum_grouping_keeps_lowest_id(self):
+        docs = [
+            {"id": 5, "checksum": "aaa", "title": "x", "created": "2030-01-01", "page_count": 2},
+            {"id": 2, "checksum": "aaa", "title": "y", "created": "2030-02-01", "page_count": 9},
+            {"id": 7, "checksum": "bbb", "title": "z", "created": "2030-03-01", "page_count": 1},
+        ]
+        groups, skipped = await paperless._dedupe_build_groups(
+            docs, _content_fetcher({}), metadata_match=True
+        )
+        assert skipped == 0
+        assert len(groups) == 1
+        assert groups[0]["ids"] == [2, 5]  # lowest id first (the kept original)
+        assert groups[0]["text_differs"] is False
+
+    @pytest.mark.asyncio
+    async def test_metadata_page_count_grouping(self):
+        # Same correspondent/type/date/title + same page_count, DIFFERENT checksums
+        # (re-scan) → metadata group with text_differs True.
+        docs = [
+            {"id": 3, "checksum": "c1", "title": "Vertrag", "correspondent": "ACME",
+             "document_type": "Vertrag", "created": "2030-01-01", "page_count": 4},
+            {"id": 8, "checksum": "c2", "title": "Vertrag", "correspondent": "ACME",
+             "document_type": "Vertrag", "created": "2030-01-01", "page_count": 4},
+        ]
+        groups, skipped = await paperless._dedupe_build_groups(
+            docs, _content_fetcher({}), metadata_match=True
+        )
+        assert len(groups) == 1
+        assert groups[0]["ids"] == [3, 8]
+        assert groups[0]["text_differs"] is True  # re-scan (differing bytes)
+
+    @pytest.mark.asyncio
+    async def test_metadata_different_page_counts_not_grouped(self):
+        docs = [
+            {"id": 3, "checksum": "c1", "title": "Vertrag", "created": "2030-01-01", "page_count": 4},
+            {"id": 8, "checksum": "c2", "title": "Vertrag", "created": "2030-01-01", "page_count": 5},
+        ]
+        groups, _ = await paperless._dedupe_build_groups(
+            docs, _content_fetcher({}), metadata_match=True
+        )
+        assert groups == []
+
+    @pytest.mark.asyncio
+    async def test_byte_identical_ocr_fallback(self):
+        # metadata_match OFF → byte-identical OCR comparison.
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+            {"id": 9, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+        ]
+        fetch = _content_fetcher({4: "same body text", 9: "same body text"})
+        groups, skipped = await paperless._dedupe_build_groups(docs, fetch, metadata_match=False)
+        assert skipped == 0
+        assert len(groups) == 1
+        assert groups[0]["ids"] == [4, 9]
+        assert groups[0]["text_differs"] is False
+
+    @pytest.mark.asyncio
+    async def test_byte_identical_ocr_differs_not_grouped(self):
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+            {"id": 9, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+        ]
+        fetch = _content_fetcher({4: "one text", 9: "totally different text"})
+        groups, _ = await paperless._dedupe_build_groups(docs, fetch, metadata_match=False)
+        assert groups == []
+
+    @pytest.mark.asyncio
+    async def test_empty_title_downgrades_to_byte_identical(self):
+        # metadata_match ON but EMPTY title → must NOT trust metadata; falls back to OCR.
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "", "created": "2030-01-01", "page_count": 1},
+            {"id": 9, "checksum": "c2", "title": "", "created": "2030-01-01", "page_count": 1},
+        ]
+        calls = []
+        async def _f(doc_id):
+            calls.append(doc_id)
+            return "identical", False
+        groups, _ = await paperless._dedupe_build_groups(docs, _f, metadata_match=True)
+        assert calls == [4, 9]  # OCR was fetched (fallback path taken)
+        assert len(groups) == 1 and groups[0]["ids"] == [4, 9]
+
+    @pytest.mark.asyncio
+    async def test_missing_page_count_downgrades_to_byte_identical(self):
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": None},
+            {"id": 9, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 3},
+        ]
+        calls = []
+        async def _f(doc_id):
+            calls.append(doc_id)
+            return "same", False
+        groups, _ = await paperless._dedupe_build_groups(docs, _f, metadata_match=True)
+        assert set(calls) == {4, 9}  # fell back to OCR because one page_count is missing
+        assert len(groups) == 1
+
+    @pytest.mark.asyncio
+    async def test_member_without_ocr_never_deleted(self):
+        # No OCR text → cannot be proven identical → skipped, never grouped.
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+            {"id": 9, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+        ]
+        fetch = _content_fetcher({4: "", 9: ""})  # both empty OCR
+        groups, skipped = await paperless._dedupe_build_groups(docs, fetch, metadata_match=False)
+        assert groups == []
+        assert skipped == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_error_counts_as_skipped(self):
+        docs = [
+            {"id": 4, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+            {"id": 9, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+        ]
+        fetch = _content_fetcher({9: "text"}, errors={4})
+        groups, skipped = await paperless._dedupe_build_groups(docs, fetch, metadata_match=False)
+        assert groups == []
+        assert skipped == 1  # the fetch error; the lone remaining doc is simply un-paired
+
+
+class TestDedupeDocuments:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        result = await paperless.dedupe_documents()
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_missing_token_returns_error(self):
+        paperless.PAPERLESS_API_URL = "http://test"
+        paperless.PAPERLESS_API_TOKEN = ""
+        result = await paperless.dedupe_documents()
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_enumeration_error_propagates(self, monkeypatch):
+        monkeypatch.setattr(
+            paperless, "list_all_documents",
+            AsyncMock(return_value={"error": "boom"}),
+        )
+        result = await paperless.dedupe_documents(dry_run=True)
+        assert "error" in result and "boom" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_duplicates(self, monkeypatch):
+        docs = [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "b", "title": "y", "created": "2030-01-02", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        delete = AsyncMock()
+        monkeypatch.setattr(paperless, "delete_document", delete)
+        result = await paperless.dedupe_documents(dry_run=False)
+        assert result["groups"] == 0
+        assert result["duplicate_copies"] == 0
+        assert result["deleted"] == 0
+        assert result["complete"] is True
+        delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dry_run_deletes_nothing(self, monkeypatch):
+        docs = [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 3, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        delete = AsyncMock(return_value={"deleted": True})
+        monkeypatch.setattr(paperless, "delete_document", delete)
+        result = await paperless.dedupe_documents(dry_run=True)
+        assert result["dry_run"] is True
+        assert result["groups"] == 1
+        assert result["kept"] == 1
+        assert result["duplicate_copies"] == 2
+        assert result["deleted"] == 0
+        assert result["remaining"] == 2
+        assert result["deleted_ids"] == []
+        delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deletes_extras_keeps_lowest(self, monkeypatch):
+        docs = [
+            {"id": 7, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 5, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        deleted = []
+        async def _del(doc_id):
+            deleted.append(doc_id)
+            return {"deleted": True, "id": doc_id}
+        monkeypatch.setattr(paperless, "delete_document", AsyncMock(side_effect=_del))
+        result = await paperless.dedupe_documents(dry_run=False)
+        assert result["deleted"] == 2
+        assert set(result["deleted_ids"]) == {5, 7}  # id 2 (lowest) kept
+        assert 2 not in deleted
+        assert result["remaining"] == 0
+        assert result["complete"] is True
+
+    @pytest.mark.asyncio
+    async def test_max_delete_batching_and_remaining(self, monkeypatch):
+        docs = [
+            {"id": i, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1}
+            for i in range(1, 6)  # ids 1..5, all one checksum → 4 extras
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        monkeypatch.setattr(
+            paperless, "delete_document",
+            AsyncMock(side_effect=lambda doc_id: {"deleted": True, "id": doc_id}),
+        )
+        result = await paperless.dedupe_documents(dry_run=False, max_delete=2)
+        assert result["duplicate_copies"] == 4
+        assert result["deleted"] == 2
+        assert result["remaining"] == 2  # re-run to continue
+
+    @pytest.mark.asyncio
+    async def test_partial_enumeration_complete_false(self, monkeypatch):
+        docs = [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+        ]
+        # truncated listing: returned < total_count
+        monkeypatch.setattr(
+            paperless, "list_all_documents",
+            AsyncMock(return_value=_listing(docs, total=999, truncated=True)),
+        )
+        monkeypatch.setattr(
+            paperless, "delete_document",
+            AsyncMock(side_effect=lambda doc_id: {"deleted": True, "id": doc_id}),
+        )
+        result = await paperless.dedupe_documents(dry_run=True)
+        assert result["complete"] is False
+        assert "PARTIALLY" in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_delete_failure_counts_as_skipped_and_remaining(self, monkeypatch):
+        docs = [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        monkeypatch.setattr(
+            paperless, "delete_document",
+            AsyncMock(return_value={"error": "Document 2 not found"}),
+        )
+        result = await paperless.dedupe_documents(dry_run=False)
+        assert result["deleted"] == 0
+        assert result["skipped"] == 1
+        assert result["remaining"] == 1
+
+    @pytest.mark.asyncio
+    async def test_metadata_match_false_uses_ocr(self, monkeypatch):
+        # page_count present, but metadata_match=False → OCR fetch drives grouping.
+        docs = [
+            {"id": 1, "checksum": "c1", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "c2", "title": "Brief", "created": "2030-01-01", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        get_doc = AsyncMock(return_value={"content": "identical ocr"})
+        monkeypatch.setattr(paperless, "get_document", get_doc)
+        monkeypatch.setattr(
+            paperless, "delete_document",
+            AsyncMock(side_effect=lambda doc_id: {"deleted": True, "id": doc_id}),
+        )
+        result = await paperless.dedupe_documents(dry_run=False, metadata_match=False)
+        assert get_doc.await_count == 2  # OCR fetched for both members
+        assert result["deleted"] == 1
+        assert result["deleted_ids"] == [2]
+
+    @pytest.mark.asyncio
+    async def test_circuit_breaker_stops_on_repeat_delete(self, monkeypatch):
+        docs = [{"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1}]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        # Force a group whose extras contain the SAME id twice (a looping condition).
+        monkeypatch.setattr(
+            paperless, "_dedupe_build_groups",
+            AsyncMock(return_value=([{"ids": [1, 2, 2], "text_differs": False}], 0)),
+        )
+        del_calls = []
+        async def _del(doc_id):
+            del_calls.append(doc_id)
+            return {"deleted": True, "id": doc_id}
+        monkeypatch.setattr(paperless, "delete_document", AsyncMock(side_effect=_del))
+        result = await paperless.dedupe_documents(dry_run=False, max_delete=100)
+        # Deleted id 2 once, then the breaker aborted on the repeat.
+        assert result["deleted"] == 1
+        assert result["deleted_ids"] == [2]
+        assert del_calls == [2, 2]  # attempted twice, only counted once
+
+    @pytest.mark.asyncio
+    async def test_max_delete_zero_reports_scope_only(self, monkeypatch):
+        docs = [
+            {"id": 1, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+            {"id": 2, "checksum": "a", "title": "x", "created": "2030-01-01", "page_count": 1},
+        ]
+        monkeypatch.setattr(paperless, "list_all_documents", AsyncMock(return_value=_listing(docs)))
+        delete = AsyncMock()
+        monkeypatch.setattr(paperless, "delete_document", delete)
+        result = await paperless.dedupe_documents(dry_run=False, max_delete=0)
+        assert result["deleted"] == 0
+        assert result["remaining"] == 1
+        delete.assert_not_called()
+
+
+class TestDedupeRetry:
+    @pytest.mark.asyncio
+    async def test_retries_on_429_then_succeeds(self, monkeypatch):
+        monkeypatch.setattr(paperless, "_DEDUPE_RATE_SLEEP", 0)
+        calls = {"n": 0}
+
+        class _Resp:
+            status_code = 429
+
+        async def _op():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise paperless.httpx.HTTPStatusError("429", request=None, response=_Resp())
+            return {"ok": True}
+
+        result = await paperless._dedupe_retry(_op)
+        assert result == {"ok": True}
+        assert calls["n"] == 3
+
+    @pytest.mark.asyncio
+    async def test_non_429_raises(self, monkeypatch):
+        class _Resp:
+            status_code = 500
+
+        async def _op():
+            raise paperless.httpx.HTTPStatusError("500", request=None, response=_Resp())
+
+        with pytest.raises(paperless.httpx.HTTPStatusError):
+            await paperless._dedupe_retry(_op)
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_error_string_retried(self, monkeypatch):
+        monkeypatch.setattr(paperless, "_DEDUPE_RATE_SLEEP", 0)
+        results = iter([{"error": "rate limit exceeded"}, {"ok": 1}])
+
+        async def _op():
+            return next(results)
+
+        assert await paperless._dedupe_retry(_op) == {"ok": 1}

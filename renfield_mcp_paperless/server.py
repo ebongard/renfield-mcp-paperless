@@ -13,11 +13,13 @@ Environment variables:
 
 import asyncio
 import base64
+import hashlib
 import logging
 import mimetypes
 import os
 import re
 import sys
+import time
 from collections import Counter
 from typing import Literal, Optional
 
@@ -1267,6 +1269,283 @@ async def delete_document(document_id: int) -> dict:
         resp.raise_for_status()
 
     return {"deleted": True, "id": document_id}
+
+
+# --- Duplicate detection + removal (dedupe_documents) ---
+#
+# Ported from the Renfield backend's paperless_dedupe_tool, which orchestrated the
+# same logic across many MCP round-trips. Living here, it calls Paperless DIRECTLY
+# through the same tool internals (``list_all_documents`` / ``get_document`` /
+# ``delete_document``) and owns its own rate-limit handling + delete budget.
+
+# Paperless-ngx REST rate-limits (a 429). The token bucket refills ~1/s, so a
+# throttled enumeration / OCR fetch / delete is retried a handful of times with a
+# short sleep rather than failing the whole sweep.
+_DEDUPE_RATE_RETRY = 6      # attempts on a 429 before giving up on one call
+_DEDUPE_RATE_SLEEP = 1.2    # seconds to wait for the bucket to refill
+_DEDUPE_MAX_DELETE_SECONDS = 75  # wall-clock budget for the delete loop so one call
+#                                  can't hang; extras not reached count as remaining.
+
+
+def _dedupe_content_hash(text: str | None) -> str | None:
+    """sha256 of the FULL OCR text, or None when there is no text to hash (a doc
+    with no OCR content can never be *proven* identical → it must never be deleted)."""
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+
+
+def _dedupe_candidate_key(doc: dict) -> tuple:
+    """Cheap metadata grouping key — narrows the set that needs a full-content
+    fetch. Re-uploads / re-scans share correspondent, type, date and title."""
+    created = (doc.get("created") or "")[:10]  # date only, YYYY-MM-DD
+    return (
+        (doc.get("correspondent") or "").strip().lower(),
+        (doc.get("document_type") or "").strip().lower(),
+        created,
+        (doc.get("title") or "").strip().lower(),
+    )
+
+
+async def _dedupe_retry(make_coro):
+    """Await an async Paperless operation, retrying ONLY on a rate-limit (Paperless
+    returns HTTP 429, which the tool internals surface as an ``httpx.HTTPStatusError``;
+    an older/other layer may instead return ``{"error": "...rate limit..."}``). Any
+    other error is returned/raised as-is. ``make_coro`` is a zero-arg callable that
+    returns a fresh coroutine each attempt (so it can actually be retried)."""
+    last: dict = {"error": "rate_limited"}
+    for _ in range(_DEDUPE_RATE_RETRY):
+        try:
+            res = await make_coro()
+        except httpx.HTTPStatusError as exc:  # noqa: PERF203
+            if exc.response is not None and exc.response.status_code == 429:
+                await asyncio.sleep(_DEDUPE_RATE_SLEEP)
+                continue
+            raise
+        err = str(res.get("error") or "") if isinstance(res, dict) else ""
+        if err and "rate limit" in err.lower():
+            await asyncio.sleep(_DEDUPE_RATE_SLEEP)
+            last = res
+            continue
+        return res
+    return last
+
+
+async def _dedupe_build_groups(docs, fetch_content, metadata_match):
+    """Group ``docs`` (as returned by ``list_all_documents``) into duplicate sets.
+
+    Returns ``(dup_groups, skipped)`` where each group is
+    ``{"ids": sorted[int], "text_differs": bool}`` (``text_differs`` marks a group
+    detected via the metadata/page_count path, i.e. a re-scan with differing bytes).
+    ``fetch_content(doc_id)`` is an async callable returning ``(content_or_None,
+    error_bool)`` — injected so the byte-identical OCR fallback is unit-testable.
+
+    Identity (any one sufficient):
+      PASS 1 — identical file ``checksum`` (MD5): the strongest, cheapest signal;
+               needs no per-doc fetch. Docs without a checksum fall through.
+      PASS 2 — on everything NOT claimed by a checksum group:
+        * metadata_match ON, NON-EMPTY title, every member carrying a page_count →
+          sub-group by page_count. Same (correspondent, type, date, title, page_count)
+          ⇒ the same document even when a re-scan's OCR bytes differ.
+        * otherwise (match off / empty title / any missing page_count) → BYTE-IDENTICAL
+          OCR fallback: fetch each member's full OCR text, sha256 it, group by hash; a
+          member with no OCR text can't be proven identical → skipped, never deleted.
+    """
+    skipped = 0
+    dup_groups: list[dict] = []
+
+    # PASS 1 — exact checksum groups (byte-identical files).
+    by_checksum: dict[str, list[int]] = {}
+    for d in docs:
+        if d.get("id") is None:
+            continue
+        cs = d.get("checksum")
+        if cs:
+            by_checksum.setdefault(cs, []).append(d["id"])
+    claimed: set[int] = set()
+    for ids in by_checksum.values():
+        if len(ids) >= 2:
+            dup_groups.append({"ids": sorted(ids), "text_differs": False})
+            claimed.update(ids)
+
+    # PASS 2 — metadata / OCR-hash on everything not already a byte-identical dup.
+    candidates: dict[tuple, list[dict]] = {}
+    for d in docs:
+        if d.get("id") is None or d["id"] in claimed:
+            continue
+        candidates.setdefault(_dedupe_candidate_key(d), []).append(d)
+
+    async def _byte_identical_groups(members: list[dict]) -> list[dict]:
+        nonlocal skipped
+        by_hash: dict[str, list[int]] = {}
+        for m in members:
+            content, err = await fetch_content(m["id"])
+            if err:
+                skipped += 1
+                continue
+            h = _dedupe_content_hash(content)
+            if h is None:  # no OCR text → can't prove identity → never delete
+                skipped += 1
+                continue
+            by_hash.setdefault(h, []).append(m["id"])
+        return [
+            {"ids": sorted(ids), "text_differs": False}
+            for ids in by_hash.values()
+            if len(ids) >= 2
+        ]
+
+    for meta_key, members in candidates.items():
+        if len(members) < 2:
+            continue
+        title = meta_key[3]
+        strong_metadata = (
+            metadata_match
+            and bool(title)
+            and all(m.get("page_count") is not None for m in members)
+        )
+        if not strong_metadata:
+            dup_groups.extend(await _byte_identical_groups(members))
+            continue
+        by_page: dict[object, list[dict]] = {}
+        for m in members:
+            by_page.setdefault(m["page_count"], []).append(m)
+        for grp in by_page.values():
+            if len(grp) < 2:
+                continue
+            ids_sorted = sorted(m["id"] for m in grp)
+            # Members reaching pass 2 all have distinct-or-null checksums (identical
+            # ones were claimed in pass 1), so a same-page_count group is a re-scan
+            # with differing bytes → text_differs.
+            checksums = {m.get("checksum") for m in grp}
+            text_differs = len(checksums) > 1 or None in checksums
+            dup_groups.append({"ids": ids_sorted, "text_differs": text_differs})
+    return dup_groups, skipped
+
+
+@mcp.tool()
+async def dedupe_documents(
+    dry_run: bool = True,
+    max_delete: int = 200,
+    metadata_match: bool = True,
+) -> dict:
+    """Find duplicate Paperless documents and (unless dry_run) delete the extras.
+
+    Enumerates the WHOLE archive INDEX-INDEPENDENTLY via ``list_all_documents`` (so a
+    stale search index can't hide copies), groups documents into duplicate sets, keeps
+    the LOWEST id (the original) of each group and trashes the rest (Paperless 2.x →
+    recoverable trash). A document is a duplicate of another when ANY of: identical
+    file checksum; OR — with ``metadata_match`` — identical
+    (correspondent, type, created-date, title, page_count) (catches re-scans whose OCR
+    bytes differ); OR byte-identical OCR text. A member with no OCR text is never
+    deleted (can't be proven identical).
+
+    Rate-limit-safe: each Paperless call retries on a 429; the delete loop is bounded
+    by ``max_delete`` AND a ~75 s wall-clock budget, then reports how many ``remaining``
+    so the caller re-runs until 0. Only a COMPLETE enumeration sets ``complete=True``.
+
+    Args:
+        dry_run: True (default) → find + report only, delete nothing.
+        max_delete: max extras to trash in this call (default 200; the rest remain).
+        metadata_match: enable the metadata/page_count re-scan path (default True);
+            False → byte-identical OCR matching only.
+
+    Returns a dict with: scanned, groups, metadata_groups, duplicate_copies, kept,
+    skipped, deleted, remaining, complete, dry_run, deleted_ids (plus a message).
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    max_delete = max(0, int(max_delete))
+
+    # 1. Enumerate the whole archive (index-independent, carries checksum + page_count).
+    listing = await _dedupe_retry(lambda: list_all_documents(include_checksum=True))
+    if not isinstance(listing, dict) or listing.get("error"):
+        err = listing.get("error") if isinstance(listing, dict) else "unknown"
+        return {"error": f"enumeration failed: {err}"}
+    summary = listing.get("summary") or {}
+    docs = listing.get("results") or []
+    total_count = summary.get("total_count")
+    # complete ONLY on a full enumeration — never claim clean on a partial/truncated one.
+    complete = (
+        total_count is not None
+        and len(docs) >= total_count
+        and not summary.get("truncated")
+    )
+
+    async def _fetch_content(doc_id: int):
+        res = await _dedupe_retry(
+            lambda: get_document(doc_id, include_content=True)
+        )
+        if not isinstance(res, dict) or res.get("error"):
+            return None, True
+        return res.get("content"), False
+
+    dup_groups, skipped = await _dedupe_build_groups(docs, _fetch_content, metadata_match)
+    groups_found = len(dup_groups)
+    metadata_groups = sum(1 for g in dup_groups if g["text_differs"])
+    kept = groups_found  # one canonical original kept per group
+    extras = [doc_id for g in dup_groups for doc_id in g["ids"][1:]]
+    total_extras = len(extras)
+
+    def _result(skipped_val, deleted, remaining, deleted_ids, message) -> dict:
+        return {
+            "scanned": len(docs),
+            "groups": groups_found,
+            "metadata_groups": metadata_groups,
+            "duplicate_copies": total_extras,
+            "kept": kept,
+            "skipped": skipped_val,
+            "deleted": deleted,
+            "remaining": remaining,
+            "complete": complete,
+            "dry_run": dry_run,
+            "deleted_ids": deleted_ids,
+            "message": message,
+        }
+
+    partial = "" if complete else " (archive only PARTIALLY enumerated — re-run)"
+
+    if dry_run or total_extras == 0 or max_delete == 0:
+        if total_extras == 0:
+            msg = f"No duplicates found in {len(docs)} documents{partial}."
+        else:
+            msg = (
+                f"{groups_found} duplicate group(s), {total_extras} extra copies "
+                f"({kept} originals kept); nothing deleted (dry_run){partial}."
+            )
+        return _result(skipped, 0, total_extras, [], msg)
+
+    # 2. Delete a bounded batch of extras (keep the lowest id of each group).
+    deadline = time.monotonic() + _DEDUPE_MAX_DELETE_SECONDS
+    deleted_ids: list[int] = []
+    deleted_set: set[int] = set()
+    delete_failed = 0
+    for doc_id in extras[:max_delete]:
+        if time.monotonic() >= deadline:
+            break
+        res = await _dedupe_retry(lambda did=doc_id: delete_document(did))
+        if isinstance(res, dict) and res.get("deleted"):
+            # Circuit-breaker: a "success" for an id we already deleted this call means
+            # something is looping — stop rather than double-count / spin forever.
+            if doc_id in deleted_set:
+                break
+            deleted_ids.append(doc_id)
+            deleted_set.add(doc_id)
+        else:
+            delete_failed += 1
+    remaining = total_extras - len(deleted_ids)
+    total_skipped = skipped + delete_failed
+
+    parts = [f"Trashed {len(deleted_ids)} duplicate(s)"]
+    if remaining > 0:
+        parts.append(f"{remaining} of {total_extras} copies remain — re-run to continue")
+    if total_skipped:
+        parts.append(f"{total_skipped} document(s) could not be checked/deleted")
+    if not complete:
+        parts.append("the archive was only partially enumerated")
+    return _result(total_skipped, len(deleted_ids), remaining, deleted_ids, ". ".join(parts) + ".")
 
 
 @mcp.tool()

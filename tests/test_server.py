@@ -4045,3 +4045,559 @@ class TestDedupeRetry:
             return next(results)
 
         assert await paperless._dedupe_retry(_op) == {"ok": 1}
+
+
+# ── search_index_health (Fix B) ─────────────────────────────────
+
+
+def _idx_doc(i, title="Rechnung", added="2020-01-01T00:00:00+00:00"):
+    return {"id": i, "title": title, "added": added}
+
+
+class _NullClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeIndex:
+    """Stands in for the Paperless DB listing + search index + workflow list behind
+    the tool's HTTP helpers. ``indexed`` = ids the index contains; a touch re-indexes
+    the doc when ``heal_works``. ``pages`` makes the listing page-aware (the
+    positive control reads page 1); without it every page returns ``docs``."""
+
+    def __init__(self, docs, indexed, *, status=(None, None), heal_works=True,
+                 reject_query=False, next_url=None, count=None, pages=None,
+                 workflows=0, gone=()):
+        self.docs = docs
+        self.pages = pages
+        self.indexed = set(indexed)
+        self.status = status
+        self.heal_works = heal_works
+        self.reject_query = reject_query
+        self.next_url = next_url
+        self.count = len(docs) if count is None else count
+        self.workflows = workflows
+        self.gone = set(gone)
+        self.touched = []
+        self.probed = []
+        self.listed = []
+        self.workflow_checks = 0
+
+    async def status_fn(self, client):
+        return self.status
+
+    async def list_fn(self, client, page, page_size):
+        self.listed.append(page)
+        if self.pages is not None:
+            if page not in self.pages:
+                return None
+            nxt = f"http://x/?page={page + 1}" if page + 1 in self.pages else None
+            return {"count": self.count, "next": nxt, "results": self.pages[page][:page_size]}
+        if page > 1 and self.next_url is None:
+            return None
+        return {"count": self.count, "next": self.next_url, "results": self.docs[:page_size]}
+
+    async def contains_fn(self, client, doc_id):
+        self.probed.append(doc_id)
+        if self.reject_query:
+            return None
+        return doc_id in self.indexed
+
+    async def touch_fn(self, client, doc_id):
+        if doc_id in self.gone:
+            return "gone"
+        self.touched.append(doc_id)
+        if self.heal_works:
+            self.indexed.add(doc_id)
+        return "ok"
+
+    async def workflows_fn(self, client):
+        self.workflow_checks += 1
+        return self.workflows
+
+
+def _install_index(monkeypatch, fake):
+    monkeypatch.setattr(paperless, "_index_status", fake.status_fn)
+    monkeypatch.setattr(paperless, "_index_list_page", fake.list_fn)
+    monkeypatch.setattr(paperless, "_index_contains", fake.contains_fn)
+    monkeypatch.setattr(paperless, "_index_touch", fake.touch_fn)
+    monkeypatch.setattr(paperless, "_active_update_workflows", fake.workflows_fn)
+    monkeypatch.setattr(paperless, "_INDEX_REPROBE_DELAY_S", 0)
+    monkeypatch.setattr(paperless.httpx, "AsyncClient", lambda *a, **k: _NullClient())
+
+
+class TestIndexVerdict:
+    def test_empty(self):
+        assert paperless._index_verdict(0, 0) == "empty"
+
+    def test_healthy(self):
+        assert paperless._index_verdict(5, 0) == "healthy"
+
+    def test_degraded_needs_at_least_one_hit(self):
+        """A found doc proves the probe works → the misses are real."""
+        assert paperless._index_verdict(3, 2) == "degraded"
+
+    def test_all_missing_is_inconclusive_not_degraded(self):
+        """None found is equally consistent with a wiped index and an unsupported
+        probe — it must never read as a proven degradation on its own."""
+        assert paperless._index_verdict(0, 4) == "inconclusive"
+
+    def test_all_missing_with_proof_is_degraded(self):
+        assert paperless._index_verdict(0, 4, proven=True) == "degraded"
+
+
+class TestIndexLostOldDocuments:
+    """The 2026-08 shape: new documents indexed, everything below a boundary gone.
+    Every old page is 100 % missing, so same-page evidence alone never proves a gap.
+    Check mode (heal=False) must still report ``degraded``."""
+
+    @pytest.mark.asyncio
+    async def test_positive_control_proves_an_entirely_missing_old_page(self, monkeypatch):
+        pages = {1: [_idx_doc(i) for i in (100, 99, 98)], 2: [_idx_doc(i) for i in (50, 49, 48)]}
+        fake = _FakeIndex([], indexed=[100, 99, 98], pages=pages)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(page=2, heal=False)
+        assert res["verdict"] == "degraded"
+        assert res["found"] == 0 and res["missing"] == 3
+        assert res["control_found"] is True and res["control_id"] == 100
+        assert res["probe_proven"] is True
+        assert fake.touched == []  # check mode never writes
+
+    @pytest.mark.asyncio
+    async def test_control_not_found_stays_inconclusive(self, monkeypatch):
+        pages = {1: [_idx_doc(i) for i in (100, 99)], 2: [_idx_doc(i) for i in (50, 49)]}
+        fake = _FakeIndex([], indexed=[], pages=pages)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(page=2)
+        assert res["verdict"] == "inconclusive"
+        assert res["control_found"] is False
+        assert res["probe_proven"] is False
+
+    @pytest.mark.asyncio
+    async def test_carried_over_proof_needs_no_control(self, monkeypatch):
+        pages = {1: [_idx_doc(100)], 2: [_idx_doc(50), _idx_doc(49)]}
+        fake = _FakeIndex([], indexed=[], pages=pages)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(page=2, probe_proven=True)
+        assert res["verdict"] == "degraded"
+        assert fake.listed == [2]  # no control lookup
+        # Output proof reflects only THIS call's evidence, so a caller's stored
+        # proof can expire instead of refreshing itself forever.
+        assert res["probe_proven"] is False
+
+    @pytest.mark.asyncio
+    async def test_same_page_hit_needs_no_control(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2)], indexed=[3])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health()
+        assert res["verdict"] == "degraded"
+        assert fake.listed == [1]
+        assert res["probe_proven"] is True
+
+
+class TestSearchIndexHealth:
+    @pytest.mark.asyncio
+    async def test_missing_url_returns_error(self):
+        paperless.PAPERLESS_API_URL = ""
+        assert "error" in await paperless.search_index_health()
+
+    @pytest.mark.asyncio
+    async def test_healthy_touches_nothing(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2), _idx_doc(1)], indexed=[1, 2, 3])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["index_check"] is True
+        assert res["verdict"] == "healthy"
+        assert res["sampled"] == 3 and res["missing"] == 0
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_degraded_detect_only_never_writes(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2), _idx_doc(1)], indexed=[3])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=False)
+        assert res["verdict"] == "degraded"
+        assert res["missing_ids"] == [2, 1]
+        assert res["heal_attempted"] is False
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_degraded_heal_resaves_and_reports_healed_ids(self, monkeypatch):
+        docs = [_idx_doc(3, "A"), _idx_doc(2, "B"), _idx_doc(1, "C")]
+        fake = _FakeIndex(docs, indexed=[3])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["verdict"] == "degraded"
+        assert fake.touched == [2, 1]
+        assert fake.workflow_checks == 1  # pre-flight ran before any write
+        assert res["healed"] == 2 and res["healed_ids"] == [2, 1]
+        assert res["found_ids"] == [3]
+        assert res["still_missing_ids"] == []
+
+    @pytest.mark.asyncio
+    async def test_heal_ineffective_reports_still_missing(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], heal_works=False)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["touched"] == 1
+        assert res["healed"] == 0
+        assert res["still_missing_ids"] == [1]
+
+    @pytest.mark.asyncio
+    async def test_max_touch_caps_writes(self, monkeypatch):
+        docs = [_idx_doc(i) for i in range(10, 0, -1)]
+        fake = _FakeIndex(docs, indexed=[10])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, max_touch=2)
+        assert len(fake.touched) == 2
+        assert res["missing"] == 9 and res["healed"] == 2
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_without_heal_touches_nothing(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=False)
+        assert res["verdict"] == "inconclusive"
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_canary_proves_degradation(self, monkeypatch):
+        """Nothing found → re-save ONE canary; it appears → the probe works and the
+        index really lacks documents → proceed as degraded within the budget."""
+        docs = [_idx_doc(3), _idx_doc(2), _idx_doc(1)]
+        fake = _FakeIndex(docs, indexed=[])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, max_touch=25)
+        assert res["verdict"] == "degraded"
+        assert fake.touched == [3, 2, 1]  # canary first
+        assert res["healed"] == 3
+        assert res["probe_proven"] is True
+
+    @pytest.mark.asyncio
+    async def test_inconclusive_canary_fails_stops_after_one(self, monkeypatch):
+        """The weak-signal guard: an unproven probe may cost at most ONE re-save."""
+        docs = [_idx_doc(3), _idx_doc(2), _idx_doc(1)]
+        fake = _FakeIndex(docs, indexed=[], heal_works=False)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, max_touch=25)
+        assert res["verdict"] == "inconclusive"
+        assert len(fake.touched) == 1
+        assert res["healed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_index_error_short_circuits(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(1)], indexed=[], status=("ERROR", "cannot open"))
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["verdict"] == "index_error"
+        assert res["index_error"] == "cannot open"
+        assert fake.listed == [] and fake.probed == [] and fake.touched == []
+        assert "document_index reindex" in res["message"]
+
+    @pytest.mark.asyncio
+    async def test_rejected_probe_query_never_heals(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[], reject_query=True)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["verdict"] == "inconclusive"
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_too_new_documents_are_not_judged(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        fake = _FakeIndex([_idx_doc(2, added=now_iso), _idx_doc(1)], indexed=[1])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(min_age_seconds=900)
+        assert res["sampled"] == 1
+        assert 2 not in fake.probed
+        assert res["verdict"] == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_past_last_page_is_empty_and_ends_walk(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(1)], indexed=[1], next_url=None)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(page=5)
+        assert res["verdict"] == "empty"
+        assert res["next_page"] is None
+
+    @pytest.mark.asyncio
+    async def test_next_page_propagated(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(1)], indexed=[1], next_url="http://x/?page=2", count=500)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(page=1, sample_size=1)
+        assert res["next_page"] == 2
+        assert res["db_total"] == 500
+
+    @pytest.mark.asyncio
+    async def test_persistent_rate_limit_is_incomplete_not_healthy(self, monkeypatch):
+        """A probe that stays 429 is neither a hit nor a miss — the sample must be
+        reported incomplete and never read healthy."""
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[1, 2])
+        _install_index(monkeypatch, fake)
+
+        class _Resp:
+            status_code = 429
+
+        async def _always_429(client, doc_id):
+            raise paperless.httpx.HTTPStatusError("429", request=None, response=_Resp())
+
+        monkeypatch.setattr(paperless, "_index_contains", _always_429)
+        monkeypatch.setattr(paperless, "_DEDUPE_RATE_SLEEP", 0)
+        res = await paperless.search_index_health()
+        assert res["complete"] is False
+        assert res["verdict"] != "healthy"
+
+    @pytest.mark.asyncio
+    async def test_missing_doc_without_title_is_still_healed(self, monkeypatch):
+        """The re-save sends no field at all, so a blank title is no obstacle."""
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1, title="")], indexed=[2])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert fake.touched == [1]
+        assert res["healed_ids"] == [1]
+
+
+class TestIndexHealWorkflowGuard:
+    """A heal fires Paperless's document_updated signal → every enabled
+    "Document Updated" workflow runs per healed document. Refuse unless allowed."""
+
+    @pytest.mark.asyncio
+    async def test_active_update_workflows_block_the_heal(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], workflows=2)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["verdict"] == "degraded"
+        assert res["heal_blocked"] == "workflows"
+        assert res["blocking_workflows"] == 2
+        assert res["heal_attempted"] is False
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_workflows_block_the_heal(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], workflows=None)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["heal_blocked"] == "workflows_unverifiable"
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_blocked_canary_is_not_touched_either(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[], workflows=1)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["heal_blocked"] == "workflows"
+        assert fake.touched == []
+
+    @pytest.mark.asyncio
+    async def test_override_heals_without_checking(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], workflows=3)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, allow_workflows=True)
+        assert res["heal_blocked"] is None
+        assert fake.workflow_checks == 0
+        assert fake.touched == [1]
+
+    @pytest.mark.asyncio
+    async def test_check_mode_never_reads_workflows(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], workflows=3)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=False)
+        assert res["heal_blocked"] is None
+        assert fake.workflow_checks == 0
+
+
+class TestIndexHealBookkeeping:
+    @pytest.mark.asyncio
+    async def test_excluded_ids_are_never_touched(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2), _idx_doc(1)], indexed=[3])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, exclude_ids=[2])
+        assert fake.touched == [1]
+        assert res["excluded_ids"] == [2]
+        assert res["healed_ids"] == [1]
+
+    @pytest.mark.asyncio
+    async def test_only_excluded_missing_means_no_heal_and_no_workflow_read(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2], workflows=5)
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True, exclude_ids=[1])
+        assert res["heal_attempted"] is False and res["heal_blocked"] is None
+        assert res["excluded_ids"] == [1]
+        assert fake.workflow_checks == 0
+
+    @pytest.mark.asyncio
+    async def test_deleted_document_is_skipped_not_a_failed_heal(self, monkeypatch):
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2), _idx_doc(1)], indexed=[3], gone=[2])
+        _install_index(monkeypatch, fake)
+        res = await paperless.search_index_health(heal=True)
+        assert res["skipped_ids"] == [2]
+        assert res["still_missing_ids"] == []
+        assert res["healed_ids"] == [1]
+
+    @pytest.mark.asyncio
+    async def test_reprobe_respects_the_deadline(self, monkeypatch):
+        """Re-saved documents the budget leaves un-probed are UNVERIFIED — reporting
+        them as still missing would count as a failed heal (and the call would
+        overrun the caller's timeout)."""
+        import time as _time
+        from types import SimpleNamespace
+
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            paperless, "time", SimpleNamespace(monotonic=lambda: clock["t"], time=_time.time)
+        )
+        fake = _FakeIndex([_idx_doc(2), _idx_doc(1)], indexed=[2])
+        _install_index(monkeypatch, fake)
+        original_touch = fake.touch_fn
+
+        async def _slow_touch(client, doc_id):
+            outcome = await original_touch(client, doc_id)
+            clock["t"] += paperless._INDEX_BUDGET_SECONDS + 1  # blow the budget
+            return outcome
+
+        monkeypatch.setattr(paperless, "_index_touch", _slow_touch)
+        res = await paperless.search_index_health(heal=True)
+        assert fake.touched == [1]
+        assert res["unverified_ids"] == [1]
+        assert res["still_missing_ids"] == []
+        assert res["complete"] is False
+        assert fake.probed.count(1) == 1  # not re-probed after the deadline
+
+    @pytest.mark.asyncio
+    async def test_touch_loop_respects_the_deadline(self, monkeypatch):
+        import time as _time
+        from types import SimpleNamespace
+
+        clock = {"t": 0.0}
+        monkeypatch.setattr(
+            paperless, "time", SimpleNamespace(monotonic=lambda: clock["t"], time=_time.time)
+        )
+        fake = _FakeIndex([_idx_doc(3), _idx_doc(2), _idx_doc(1)], indexed=[3])
+        _install_index(monkeypatch, fake)
+        original_touch = fake.touch_fn
+
+        async def _slow_touch(client, doc_id):
+            outcome = await original_touch(client, doc_id)
+            clock["t"] += paperless._INDEX_BUDGET_SECONDS + 1
+            return outcome
+
+        monkeypatch.setattr(paperless, "_index_touch", _slow_touch)
+        res = await paperless.search_index_health(heal=True)
+        assert fake.touched == [2]  # the second document is left for the next call
+        assert 1 in res["missing_ids"]
+        assert 1 not in res["still_missing_ids"] + res["skipped_ids"]
+        assert res["complete"] is False
+
+
+class TestActiveUpdateWorkflows:
+    @pytest.mark.asyncio
+    async def test_counts_enabled_document_updated_workflows(self, monkeypatch):
+        workflows = [
+            {"id": 1, "enabled": True, "triggers": [{"type": 1}, {"type": 3}]},
+            {"id": 2, "enabled": False, "triggers": [{"type": 3}]},
+            {"id": 3, "enabled": True, "triggers": [{"type": 2}]},
+            {"id": 4, "triggers": [{"type": "3"}]},  # enabled defaults to True
+        ]
+        monkeypatch.setattr(paperless, "_fetch_all_pages", AsyncMock(return_value=workflows))
+        assert await paperless._active_update_workflows(AsyncMock()) == 2
+
+    @pytest.mark.asyncio
+    async def test_no_workflows_is_zero(self, monkeypatch):
+        monkeypatch.setattr(paperless, "_fetch_all_pages", AsyncMock(return_value=[]))
+        assert await paperless._active_update_workflows(AsyncMock()) == 0
+
+    @pytest.mark.asyncio
+    async def test_trigger_ids_instead_of_objects_is_unverifiable(self, monkeypatch):
+        monkeypatch.setattr(
+            paperless, "_fetch_all_pages",
+            AsyncMock(return_value=[{"id": 1, "enabled": True, "triggers": [7, 8]}]),
+        )
+        assert await paperless._active_update_workflows(AsyncMock()) is None
+
+    @pytest.mark.asyncio
+    async def test_endpoint_error_is_unverifiable(self, monkeypatch):
+        class _Resp:
+            status_code = 403
+
+        async def _boom(client, url):
+            raise paperless.httpx.HTTPStatusError("403", request=None, response=_Resp())
+
+        monkeypatch.setattr(paperless, "_fetch_all_pages", _boom)
+        assert await paperless._active_update_workflows(AsyncMock()) is None
+
+
+def _idx_resp(status=200, payload=None):
+    r = MagicMock()
+    r.status_code = status
+    r.json.return_value = payload or {}
+    r.raise_for_status = MagicMock()
+    return r
+
+
+class TestIndexHttpHelpers:
+    @pytest.mark.asyncio
+    async def test_contains_queries_id_field(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(payload={"results": [{"id": 7}]}))
+        assert await paperless._index_contains(client, 7) is True
+        assert client.get.call_args.kwargs["params"]["query"] == "id:7"
+
+    @pytest.mark.asyncio
+    async def test_contains_other_id_is_a_miss(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(payload={"results": [{"id": 70}]}))
+        assert await paperless._index_contains(client, 7) is False
+
+    @pytest.mark.asyncio
+    async def test_contains_rejected_query_is_none(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(status=400))
+        assert await paperless._index_contains(client, 7) is None
+
+    @pytest.mark.asyncio
+    async def test_list_page_is_index_independent(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(payload={"count": 1, "results": []}))
+        await paperless._index_list_page(client, 2, 50)
+        params = client.get.call_args.kwargs["params"]
+        assert "query" not in params  # never touches the search index
+        assert params["ordering"] == "-id" and params["page"] == 2
+
+    @pytest.mark.asyncio
+    async def test_list_page_past_end_is_none(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(status=404))
+        assert await paperless._index_list_page(client, 99, 50) is None
+
+    @pytest.mark.asyncio
+    async def test_touch_sends_an_empty_partial_update(self):
+        """No field is sent, so a title/tag edited after the listing can never be
+        overwritten; paperless-ngx re-indexes on every update regardless."""
+        client = AsyncMock()
+        client.patch = AsyncMock(return_value=_idx_resp())
+        assert await paperless._index_touch(client, 5) == "ok"
+        assert client.patch.call_args.kwargs["json"] == {}
+        assert client.patch.call_args.args[0].endswith("/api/documents/5/")
+
+    @pytest.mark.asyncio
+    async def test_touch_deleted_document_is_gone(self):
+        client = AsyncMock()
+        client.patch = AsyncMock(return_value=_idx_resp(status=404))
+        assert await paperless._index_touch(client, 5) == "gone"
+
+    @pytest.mark.asyncio
+    async def test_status_parsed(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(payload={"tasks": {"index_status": "OK"}}))
+        assert await paperless._index_status(client) == ("OK", None)
+
+    @pytest.mark.asyncio
+    async def test_status_unavailable_is_no_evidence(self):
+        client = AsyncMock()
+        client.get = AsyncMock(return_value=_idx_resp(status=403))
+        assert await paperless._index_status(client) == (None, None)

@@ -78,6 +78,43 @@ python -m renfield_mcp_paperless
 }
 ```
 
+## Tool: `search_index_health`
+
+Checks whether the Paperless full-text **search index** contains the documents in the
+database, and optionally re-indexes the ones it lacks.
+
+Paperless has no REST endpoint for a full reindex — that is the `document_index reindex`
+management command on the Paperless host. `/api/status/` only reports whether the index
+can be opened. A document `PATCH` re-indexes that one document, which is what healing
+uses.
+
+| Parameter         | Type | Default | Description |
+|-------------------|------|---------|-------------|
+| `sample_size`     | int  | 50      | Documents per page to probe (1–200) |
+| `page`            | int  | 1       | Page of the id-descending document list; use `next_page` to walk the archive |
+| `heal`            | bool | false   | Re-save (unchanged title) + re-probe missing documents |
+| `max_touch`       | int  | 25      | Max documents re-saved per call (0–100) |
+| `min_age_seconds` | int  | 900     | Skip documents added more recently (indexing may still run) |
+
+How it decides: the page of ids comes from the database (no `query`, index-independent);
+each id is probed with `query=id:<n>`.
+
+| `verdict`      | Meaning |
+|----------------|---------|
+| `healthy`      | every sampled document is in the index |
+| `degraded`     | some are missing while others were found — proof the probe works |
+| `inconclusive` | none found, the probe was rejected (HTTP 400), or the sample was cut short. With `heal`, ONE canary is re-saved; if it then appears the verdict becomes `degraded` |
+| `index_error`  | `/api/status/` reports the index cannot be opened — run `document_index reindex` |
+| `empty`        | nothing old enough to judge on this page |
+
+Healing never deletes, reprocesses or changes a field value; Paperless does bump
+`modified` and runs "document updated" workflows. Every request retries on HTTP 429 and
+one call has a 120 s budget.
+
+**Response** (abridged): `index_check` (contract marker), `verdict`, `db_total`, `page`,
+`next_page`, `sampled`, `found`, `missing`, `missing_ids`, `index_status`, `index_error`,
+`heal_attempted`, `touched`, `healed`, `still_missing_ids`, `complete`, `message`.
+
 ## License
 
 MIT

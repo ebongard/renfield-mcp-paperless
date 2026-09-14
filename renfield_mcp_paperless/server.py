@@ -1548,6 +1548,340 @@ async def dedupe_documents(
     return _result(total_skipped, len(deleted_ids), remaining, deleted_ids, ". ".join(parts) + ".")
 
 
+# --- Search-index health (Fix B) ------------------------------------------------
+#
+# What Paperless actually offers (verified against paperless-ngx `dev`, Tantivy
+# backend, 2026-09):
+#   * a FULL rebuild exists only as the management command
+#     ``document_index reindex [--recreate|--if-needed]`` — a shell inside the
+#     Paperless container, NOT reachable over REST;
+#   * ``POST /api/tasks/run/`` accepts only train_classifier / sanity_check;
+#     ``index_optimize`` is a no-op on Tantivy;
+#   * ``GET /api/status/`` reports ``tasks.index_status`` OK/ERROR — whether the
+#     index can be OPENED, not whether it is COMPLETE;
+#   * ``PATCH /api/documents/<id>/`` re-indexes that one document
+#     (``DocumentViewSet.update`` → ``get_backend().add_or_update``).
+# So the only REST-reachable heal is a per-document re-save, and completeness can
+# only be measured per document: list ids from the DB (index-independent), then
+# ask the index for each id.
+
+_INDEX_MAX_SAMPLE = 200
+_INDEX_MAX_TOUCH = 100
+_INDEX_BUDGET_SECONDS = 120  # wall-clock budget so one call can't hang
+_INDEX_REPROBE_DELAY_S = 1.0  # let a just-committed index write become visible
+
+
+async def _index_status(client: httpx.AsyncClient) -> tuple[str | None, str | None]:
+    """``(index_status, index_error)`` from ``/api/status/``. ``(None, None)`` when
+    the endpoint is unavailable (older Paperless, or the token lacks
+    view_system_monitoring) — absence of evidence, never a verdict."""
+    try:
+        resp = await client.get(f"{PAPERLESS_API_URL}/api/status/", headers=_headers())
+    except httpx.HTTPError:
+        return None, None
+    if resp.status_code != 200:
+        return None, None
+    try:
+        tasks = (resp.json() or {}).get("tasks") or {}
+    except ValueError:
+        return None, None
+    err = tasks.get("index_error")
+    return tasks.get("index_status"), (str(err)[:300] if err else None)
+
+
+async def _index_list_page(client: httpx.AsyncClient, page: int, page_size: int) -> dict | None:
+    """One page of documents from the DATABASE, newest id first — no ``query`` is
+    sent, so the search index is not involved. ``None`` past the last page (DRF
+    answers 404 "Invalid page")."""
+    resp = await client.get(
+        f"{PAPERLESS_API_URL}/api/documents/",
+        params={
+            "ordering": "-id",
+            "page": page,
+            "page_size": page_size,
+            "fields": "id,title,added",
+        },
+        headers=_headers(),
+    )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _index_contains(client: httpx.AsyncClient, doc_id: int) -> bool | None:
+    """Is ``doc_id`` in the search index? ``id`` is an indexed field of the Tantivy
+    schema, so ``query=id:<n>`` hits only if the document was indexed. ``None``
+    when Paperless rejects the query (HTTP 400) — the probe syntax is then not
+    supported and NOTHING may be concluded from it."""
+    resp = await client.get(
+        f"{PAPERLESS_API_URL}/api/documents/",
+        params={"query": f"id:{doc_id}", "page_size": 5, "fields": "id"},
+        headers=_headers(),
+    )
+    if resp.status_code == 400:
+        return None
+    resp.raise_for_status()
+    return any(r.get("id") == doc_id for r in (resp.json() or {}).get("results") or [])
+
+
+async def _index_touch(client: httpx.AsyncClient, doc_id: int, title: str) -> bool:
+    """Re-save a document WITHOUT changing it (PATCH its own current title) so
+    Paperless re-indexes it. Non-destructive: no field value changes; side effects
+    are a new ``modified`` timestamp and any "document updated" workflow trigger."""
+    resp = await client.patch(
+        f"{PAPERLESS_API_URL}/api/documents/{doc_id}/",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json={"title": title},
+    )
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    return True
+
+
+def _parse_added(value) -> float | None:
+    """Epoch seconds of a Paperless ``added`` ISO timestamp, None if unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _index_verdict(found: int, missing: int) -> str:
+    """Pure verdict over one probed sample.
+
+    * nothing eligible            → ``empty``
+    * every sampled doc found     → ``healthy``
+    * some found, some missing    → ``degraded`` — a found doc PROVES the probe
+                                    syntax works, so the misses are real
+    * none found                  → ``inconclusive`` — equally consistent with a
+                                    wiped index and with a probe this Paperless
+                                    does not understand; never acted on as-is
+    """
+    if found == 0 and missing == 0:
+        return "empty"
+    if missing == 0:
+        return "healthy"
+    if found > 0:
+        return "degraded"
+    return "inconclusive"
+
+
+@mcp.tool()
+async def search_index_health(
+    sample_size: int = 50,
+    page: int = 1,
+    heal: bool = False,
+    max_touch: int = 25,
+    min_age_seconds: int = 900,
+) -> dict:
+    """Check whether the Paperless full-text SEARCH INDEX actually contains the
+    documents in the database, and (with ``heal``) re-index the ones it lacks.
+
+    A stale/partial index makes documents unfindable by full-text search while
+    they still exist. Paperless's own status only says whether the index can be
+    OPENED, so this measures completeness per document: it takes one page of
+    document ids from the database (newest first, index-independent) and asks the
+    index for each id.
+
+    Verdicts: ``healthy`` · ``degraded`` (some missing — proven, because others
+    were found) · ``inconclusive`` (none found: a wiped index OR an unsupported
+    probe — with ``heal`` ONE canary document is re-saved and re-probed; only if
+    it then appears is the verdict upgraded to ``degraded``) · ``index_error``
+    (Paperless reports the index cannot be opened — a re-save cannot fix that; the
+    operator must run ``document_index reindex`` on the Paperless host) ·
+    ``empty`` (nothing old enough to judge on this page).
+
+    Healing is a NON-destructive re-save (PATCH of the document's unchanged title),
+    which makes Paperless re-index that one document. It never deletes, never
+    reprocesses/re-OCRs, and touches at most ``max_touch`` documents per call.
+    Documents added less than ``min_age_seconds`` ago are skipped (indexing may
+    still be in flight). Rate-limit-safe: every request retries on HTTP 429.
+
+    Args:
+        sample_size: documents per page to probe (1..200).
+        page: page over the id-descending document list (1-based); the result's
+            ``next_page`` lets a scheduler walk the whole archive across calls.
+        heal: re-save + re-probe missing documents (default False = detect only).
+        max_touch: max documents re-saved in this call (0..100).
+        min_age_seconds: skip documents added more recently than this.
+
+    Returns a dict with: index_check (contract marker), verdict, db_total, page,
+    next_page, sampled, found, missing, missing_ids, index_status, index_error,
+    heal_attempted, touched, healed, still_missing_ids, complete, message.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    sample_size = max(1, min(int(sample_size), _INDEX_MAX_SAMPLE))
+    page = max(1, int(page))
+    max_touch = max(0, min(int(max_touch), _INDEX_MAX_TOUCH))
+    min_age_seconds = max(0, int(min_age_seconds))
+    deadline = time.monotonic() + _INDEX_BUDGET_SECONDS
+
+    result: dict = {
+        "index_check": True,
+        "verdict": "empty",
+        "db_total": None,
+        "page": page,
+        "next_page": None,
+        "sampled": 0,
+        "found": 0,
+        "missing": 0,
+        "missing_ids": [],
+        "index_status": None,
+        "index_error": None,
+        "heal_attempted": False,
+        "touched": 0,
+        "healed": 0,
+        "still_missing_ids": [],
+        # False when the wall-clock budget cut the probe short — a partial sample
+        # is still reported, but never as healthy.
+        "complete": True,
+        "message": "",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        status, index_error = await _index_status(client)
+        result["index_status"], result["index_error"] = status, index_error
+        if isinstance(status, str) and status.upper() == "ERROR":
+            result["verdict"] = "index_error"
+            result["message"] = (
+                "Paperless reports the search index cannot be opened; a per-document "
+                "re-save cannot repair that — run `document_index reindex` on the "
+                "Paperless host."
+            )
+            return result
+
+        listing = await _dedupe_retry(lambda: _index_list_page(client, page, sample_size))
+        if listing is None:
+            result["message"] = f"Page {page} is past the end of the archive."
+            return result
+        if not isinstance(listing, dict) or listing.get("error"):
+            return {"error": f"document listing failed: {listing.get('error') if isinstance(listing, dict) else 'unknown'}"}
+        result["db_total"] = listing.get("count")
+        if listing.get("next"):
+            result["next_page"] = page + 1
+
+        now = time.time()
+        eligible: list[dict] = []
+        for d in listing.get("results") or []:
+            if d.get("id") is None:
+                continue
+            added = _parse_added(d.get("added"))
+            if added is not None and now - added < min_age_seconds:
+                continue  # too new — indexing may legitimately still be running
+            eligible.append(d)
+
+        found_docs: list[dict] = []
+        missing_docs: list[dict] = []
+        for d in eligible:
+            if time.monotonic() >= deadline:
+                result["complete"] = False
+                break
+            hit = await _dedupe_retry(lambda did=d["id"]: _index_contains(client, did))
+            if isinstance(hit, dict):
+                # _dedupe_retry gave up (persistent 429): an unanswered probe is
+                # neither a hit nor a miss — stop sampling, report incomplete.
+                result["complete"] = False
+                break
+            if hit is None:
+                # Paperless rejected the probe query: the syntax is unsupported here,
+                # so no miss can be trusted. Report and stop — never heal on this.
+                result["verdict"] = "inconclusive"
+                result["message"] = (
+                    "Paperless rejected the id probe query (HTTP 400); index "
+                    "completeness cannot be measured on this version."
+                )
+                return result
+            (found_docs if hit else missing_docs).append(d)
+
+        result["sampled"] = len(found_docs) + len(missing_docs)
+        result["found"] = len(found_docs)
+        result["missing"] = len(missing_docs)
+        result["missing_ids"] = [d["id"] for d in missing_docs]
+        verdict = _index_verdict(len(found_docs), len(missing_docs))
+        if verdict == "healthy" and not result["complete"]:
+            verdict = "inconclusive"  # a cut-short sample never reads healthy
+
+        async def _touch_and_reprobe(docs: list[dict]) -> tuple[list[int], list[int]]:
+            healed_ids: list[int] = []
+            still: list[int] = []
+            touched: list[dict] = []
+            for d in docs:
+                if time.monotonic() >= deadline:
+                    result["complete"] = False
+                    still.append(d["id"])
+                    continue
+                title = d.get("title")
+                if not isinstance(title, str) or not title:
+                    still.append(d["id"])  # nothing safe to re-save with
+                    continue
+                ok = await _dedupe_retry(
+                    lambda did=d["id"], t=title: _index_touch(client, did, t)
+                )
+                if ok is True:
+                    touched.append(d)
+                else:
+                    still.append(d["id"])
+            result["touched"] += len(touched)
+            if touched:
+                await asyncio.sleep(_INDEX_REPROBE_DELAY_S)
+            for d in touched:
+                hit = await _dedupe_retry(lambda did=d["id"]: _index_contains(client, did))
+                # Only an explicit True heals; None (rejected) or a rate-limit dict
+                # does not.
+                (healed_ids if hit is True else still).append(d["id"])
+            return healed_ids, still
+
+        if heal and max_touch > 0 and verdict in ("degraded", "inconclusive") and missing_docs:
+            result["heal_attempted"] = True
+            budget = max_touch
+            remaining_missing = list(missing_docs)
+            healed_ids: list[int] = []
+            still_ids: list[int] = []
+            if verdict == "inconclusive":
+                # Canary: re-save ONE document. If it then shows up, the probe works
+                # and the index really is missing documents → proceed as degraded.
+                canary = remaining_missing.pop(0)
+                c_healed, c_still = await _touch_and_reprobe([canary])
+                healed_ids += c_healed
+                still_ids += c_still
+                budget -= 1
+                if c_healed:
+                    verdict = "degraded"
+                else:
+                    remaining_missing = []  # unproven — touch nothing more
+            if verdict == "degraded" and budget > 0 and remaining_missing:
+                h, s = await _touch_and_reprobe(remaining_missing[:budget])
+                healed_ids += h
+                still_ids += s
+            result["healed"] = len(healed_ids)
+            # still_missing_ids = touched-but-unhealed; un-touched misses (over the
+            # budget) stay reported in missing_ids and are picked up next call.
+            result["still_missing_ids"] = still_ids
+
+    result["verdict"] = verdict
+    parts = [
+        f"verdict={verdict}",
+        f"sampled={result['sampled']}",
+        f"missing={result['missing']}",
+    ]
+    if result["heal_attempted"]:
+        parts.append(f"touched={result['touched']} healed={result['healed']}")
+    if not result["complete"]:
+        parts.append("sample cut short by the time budget")
+    result["message"] = ", ".join(parts)
+    return result
+
+
 @mcp.tool()
 async def reprocess_document(document_id: int) -> dict:
     """Trigger reprocessing of a document in Paperless-NGX.

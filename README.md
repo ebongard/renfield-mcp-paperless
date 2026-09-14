@@ -95,25 +95,49 @@ uses.
 | `heal`            | bool | false   | Re-save (unchanged title) + re-probe missing documents |
 | `max_touch`       | int  | 25      | Max documents re-saved per call (0–100) |
 | `min_age_seconds` | int  | 900     | Skip documents added more recently (indexing may still run) |
+| `probe_proven`    | bool | false   | The caller proved in an earlier call that the id probe works |
+| `exclude_ids`     | list | —       | Documents that must never be re-saved (e.g. given up after repeated failures) |
+| `allow_workflows` | bool | false   | Heal even while "Document Updated" workflows are active |
 
 How it decides: the page of ids comes from the database (no `query`, index-independent);
-each id is probed with `query=id:<n>`.
+each id is probed with `query=id:<n>`. Misses only count once the probe is **proven** to
+work on this Paperless: a document on the same page was found, a **positive control** (a
+recent document from page 1) was found in this call, or the caller passed
+`probe_proven`. The control is what catches an index that lost its *old* documents,
+where every old page is entirely missing. The output `probe_proven` reports only this
+call's evidence, so a caller's stored proof can expire.
 
 | `verdict`      | Meaning |
 |----------------|---------|
 | `healthy`      | every sampled document is in the index |
-| `degraded`     | some are missing while others were found — proof the probe works |
-| `inconclusive` | none found, the probe was rejected (HTTP 400), or the sample was cut short. With `heal`, ONE canary is re-saved; if it then appears the verdict becomes `degraded` |
+| `degraded`     | documents are missing and the probe is proven |
+| `inconclusive` | misses with an unproven probe, a rejected probe (HTTP 400), or a sample cut short. With `heal`, ONE canary is re-saved; if it then appears the verdict becomes `degraded` |
 | `index_error`  | `/api/status/` reports the index cannot be opened — run `document_index reindex` |
 | `empty`        | nothing old enough to judge on this page |
 
-Healing never deletes, reprocesses or changes a field value; Paperless does bump
-`modified` and runs "document updated" workflows. Every request retries on HTTP 429 and
-one call has a 120 s budget.
+**Healing and its side effects.** A heal sends an **empty** partial update
+(`PATCH {}`). paperless-ngx's `DocumentViewSet.update` re-indexes the document on every
+update, so no field has to be sent; nothing is overwritten, nothing is deleted or
+re-OCR'd. It is still **not side-effect free**: Paperless bumps `modified` and sends
+`document_updated`, which runs **every enabled workflow with a "Document Updated"
+trigger** once per healed document. Such workflows may assign tags, owner or
+permissions, send e-mail or call webhooks. The tool therefore reads `/api/workflows/`
+first and **refuses to heal** (`heal_blocked="workflows"`, or
+`"workflows_unverifiable"` when the list cannot be read — fail closed) unless
+`allow_workflows=true`.
+
+Every request retries on HTTP 429. One call has a 120 s budget: documents the budget
+leaves untouched stay in `missing_ids`, re-saved ones it leaves un-probed are reported in
+`unverified_ids` with `complete=false` — never as a failed heal.
 
 **Response** (abridged): `index_check` (contract marker), `verdict`, `db_total`, `page`,
-`next_page`, `sampled`, `found`, `missing`, `missing_ids`, `index_status`, `index_error`,
-`heal_attempted`, `touched`, `healed`, `still_missing_ids`, `complete`, `message`.
+`next_page`, `sampled`, `found`, `missing`, `found_ids`, `missing_ids`, `control_id`,
+`control_found`, `probe_proven`, `index_status`, `index_error`, `heal_attempted`,
+`heal_blocked`, `blocking_workflows`, `touched`, `healed`, `healed_ids`,
+`still_missing_ids` (re-saved and still absent), `skipped_ids` (could not be re-saved,
+e.g. deleted meanwhile), `excluded_ids`, `unverified_ids`, `complete`, `message`.
+
+Requires renfield-mcp-paperless ≥ 1.13.0.
 
 ## License
 

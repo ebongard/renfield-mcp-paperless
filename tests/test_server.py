@@ -3669,8 +3669,9 @@ class TestPollTaskBothApiVersions:
 
     @pytest.mark.asyncio
     async def test_v10_duplicate_raised_as_exception(self):
-        # A duplicate error escaping the plugin loop lands in the failure
-        # handler as error_type/error_message with the canonical text.
+        # Defensive: no v3.3.4 path lets the duplicate error escape the plugin
+        # loop, but if one did, the failure handler would record it as
+        # error_type/error_message with the canonical text.
         task = _v10_task(
             "failure",
             result_data={

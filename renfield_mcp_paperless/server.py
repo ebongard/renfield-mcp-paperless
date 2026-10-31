@@ -627,10 +627,12 @@ def _is_duplicate_failure(result) -> bool:
     """True when a consume FAILURE result is Paperless's duplicate rejection.
 
     ``result`` is either the v9 ``result`` string or the v10 ``result_data``
-    object. For the object, the structured ``duplicate_of`` key decides; an
-    ``error_message`` is still checked against the marker, because a duplicate
-    error raised outside the consumer's plugin loop reaches the failure handler
-    as an exception whose message is the canonical duplicate text.
+    object. For the object, the structured ``duplicate_of`` key decides. The
+    ``error_message`` is also checked against the marker, as a defensive
+    fallback only: in v3.3.4 the sole raise site of ``ConsumeFileDuplicateError``
+    (the preflight plugin) runs inside the plugin loop, which turns it into
+    ``duplicate_of``; should a later version let it escape, the failure handler
+    would record it as an exception whose message is the canonical text.
     Anything else (null, empty, other types) is not a duplicate — and must not
     crash on ``.lower()``."""
     if isinstance(result, dict):

@@ -598,26 +598,109 @@ _UPLOAD_TASK_POLL_TIMEOUT_S = 30.0
 _UPLOAD_TASK_POLL_INTERVAL_S = 1.0
 
 # Paperless-ngx rejects a duplicate document ASYNCHRONOUSLY inside the consume
-# task: the task ends in status=FAILURE with a ``result`` string, with no
-# structured "duplicate" field. The canonical message is
-# ``"<file>: Not consuming <file>: It is a duplicate of <title> (#<pk>)"``.
-# We pin the SPECIFIC phrase so a duplicate reads as a TERMINAL SUCCESS to the
-# caller (the document is already in Paperless — nothing to retry). Matched
-# case-insensitively. Kept narrow on purpose: a bare "duplicate of" can appear
-# in unrelated failure text, and misreading a genuine failure as a duplicate
-# would silently swallow it — a miss (treated as a normal failure) is the safe
-# direction, a false positive is not.
+# task: the task ends in status=FAILURE. The task record has two shapes:
+#
+#   * API v9 (Paperless-ngx 2.x, and 3.x clients asking for v9): ``result`` is a
+#     string, the canonical duplicate message being
+#     ``"<file>: Not consuming <file>: It is a duplicate of <title> (#<pk>)"``.
+#   * API v10 (the default from Paperless-ngx 3.0, task redesign #12584):
+#     ``result_data`` is a JSON object. A duplicate is
+#     ``{"duplicate_of": <pk>, "duplicate_in_trash": <bool>}``
+#     (``ConsumeFileDuplicateResult``, documents/data_models.py; the postrun
+#     handler flips the status to FAILURE when ``duplicate_of`` is present,
+#     documents/signals/handlers.py). Any other failure is
+#     ``{"error_type": ..., "error_message": ..., "traceback": ...}``.
+#
+# This MCP sends no ``Accept: ...; version=`` header, so it gets each server's
+# DEFAULT version: v9 on 2.x, v10 on 3.x.
+#
+# For the string shape we pin the SPECIFIC phrase so a duplicate reads as a
+# TERMINAL SUCCESS to the caller (the document is already in Paperless — nothing
+# to retry). Matched case-insensitively. Kept narrow on purpose: a bare
+# "duplicate of" can appear in unrelated failure text, and misreading a genuine
+# failure as a duplicate would silently swallow it — a miss (treated as a normal
+# failure) is the safe direction, a false positive is not.
 _PAPERLESS_DUPLICATE_MARKERS = ("it is a duplicate",)
 
 
-def _is_duplicate_failure(result_text) -> bool:
-    """True when a consume FAILURE ``result`` is Paperless's duplicate rejection.
-    Non-string / empty results (Paperless occasionally returns null) are not
-    duplicates — and must not crash on ``.lower()``."""
-    if not isinstance(result_text, str) or not result_text:
+def _is_duplicate_failure(result) -> bool:
+    """True when a consume FAILURE result is Paperless's duplicate rejection.
+
+    ``result`` is either the v9 ``result`` string or the v10 ``result_data``
+    object. For the object, the structured ``duplicate_of`` key decides; an
+    ``error_message`` is still checked against the marker, because a duplicate
+    error raised outside the consumer's plugin loop reaches the failure handler
+    as an exception whose message is the canonical duplicate text.
+    Anything else (null, empty, other types) is not a duplicate — and must not
+    crash on ``.lower()``."""
+    if isinstance(result, dict):
+        if result.get("duplicate_of") is not None:
+            return True
+        result = result.get("error_message")
+    if not isinstance(result, str) or not result:
         return False
-    low = result_text.lower()
+    low = result.lower()
     return any(marker in low for marker in _PAPERLESS_DUPLICATE_MARKERS)
+
+
+def _task_failure_result(task: dict):
+    """The failure payload of a task record: v10 ``result_data`` when present,
+    else the v9 ``result`` string."""
+    result_data = task.get("result_data")
+    if result_data is not None:
+        return result_data
+    return task.get("result")
+
+
+def _failure_detail(result) -> str | None:
+    """Human-readable failure text for logs and the ``detail`` field — a string
+    on both API versions, so callers never have to know the task shape."""
+    if isinstance(result, dict):
+        dup = result.get("duplicate_of")
+        if dup is not None:
+            text = f"Not consuming: It is a duplicate of document #{dup}"
+            if result.get("duplicate_in_trash"):
+                text += " Note: existing document is in the trash."
+            return text
+        msg = result.get("error_message")
+        if isinstance(msg, str) and msg:
+            error_type = result.get("error_type")
+            return f"{error_type}: {msg}" if error_type else msg
+        return None
+    if isinstance(result, str) and result:
+        return result
+    return None
+
+
+def _task_document_id(task_id: str, task: dict) -> int | None:
+    """Id of the document a SUCCESSful consume task created, on both API versions.
+
+    v10 (3.x) ``related_document_ids`` is a list; upstream's
+    ``PaperlessTask.related_document_ids`` yields at most one id
+    (``result_data.document_id``, else ``duplicate_of``), and its own v9
+    compatibility serializer maps ``related_document`` to the first element. More
+    than one id is therefore not a shape any known version produces: rather than
+    guess which one is ours (and PATCH the wrong document), it reads as "no id"
+    with a WARNING, and the caller falls back to its checksum lookup.
+    Only call this on SUCCESS: on a v10 duplicate FAILURE the list holds the id of
+    the EXISTING document, not a new one.
+
+    v9 (2.x) ``related_document`` is a single id (a string in the serializer)."""
+    ids = task.get("related_document_ids")
+    if isinstance(ids, list) and ids:
+        if len(ids) > 1:
+            logger.warning(
+                "Task %s completed SUCCESS with %d related documents; "
+                "not picking one",
+                task_id,
+                len(ids),
+            )
+            return None
+        return int(ids[0])
+    related = task.get("related_document")
+    if related is not None and related != "":
+        return int(related)
+    return None
 
 
 async def _poll_task(
@@ -631,7 +714,8 @@ async def _poll_task(
       - ``"duplicate"`` — Paperless rejected it as a duplicate (already filed);
                           terminal SUCCESS for our purposes (nothing to retry).
       - ``"failure"``   — consume failed for a non-duplicate reason; ``detail``
-                          carries Paperless's failure result string.
+                          carries Paperless's failure text (a string on
+                          both API versions).
       - ``"pending"``   — the timeout elapsed before the task became terminal.
 
     ``timeout_s`` defaults to ``_UPLOAD_TASK_POLL_TIMEOUT_S`` when omitted (the
@@ -650,9 +734,10 @@ async def _poll_task(
             resp.raise_for_status()
             data = resp.json()
 
-            # Paperless's /api/tasks/?task_id= returns a list (usually
-            # length 0 while the task is still being registered, length 1
-            # once it's in the DB).
+            # Paperless's /api/tasks/?task_id= returns a plain list on API v9
+            # (2.x) and a paginated {"results": [...]} on API v10 (3.x) —
+            # usually length 0 while the task is still being registered,
+            # length 1 once it's in the DB.
             tasks = data if isinstance(data, list) else data.get("results", [])
             if tasks:
                 task = tasks[0]
@@ -664,27 +749,27 @@ async def _poll_task(
                 # here matches both spellings.
                 status = (task.get("status") or "").upper()
                 if status == "SUCCESS":
-                    related = task.get("related_document")
-                    if related is not None:
-                        return {"status": "success", "document_id": int(related), "detail": None}
-                    logger.warning(
-                        "Task %s completed SUCCESS but has no related_document",
-                        task_id,
-                    )
-                    return {"status": "success", "document_id": None, "detail": None}
+                    document_id = _task_document_id(task_id, task)
+                    if document_id is None:
+                        logger.warning(
+                            "Task %s completed SUCCESS but has no related document",
+                            task_id,
+                        )
+                    return {"status": "success", "document_id": document_id, "detail": None}
                 if status == "FAILURE":
-                    result_text = task.get("result")
-                    is_dup = _is_duplicate_failure(result_text)
+                    result = _task_failure_result(task)
+                    is_dup = _is_duplicate_failure(result)
+                    detail = _failure_detail(result)
                     logger.warning(
                         "Task %s failed in Paperless (%s): %s",
                         task_id,
                         "duplicate" if is_dup else "non-duplicate",
-                        result_text or "no details",
+                        detail or "no details",
                     )
                     return {
                         "status": "duplicate" if is_dup else "failure",
                         "document_id": None,
-                        "detail": result_text,
+                        "detail": detail,
                     }
         except (httpx.HTTPError, _json.JSONDecodeError, ValueError) as e:
             # Narrow catch so programming errors (AttributeError, KeyError in

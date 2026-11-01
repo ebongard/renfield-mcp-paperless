@@ -3535,6 +3535,221 @@ class TestPollTaskBackCompat:
         assert await paperless._poll_task_for_document_id(client, "t1") is None
 
 
+# Task records in the two shapes Paperless-ngx serves, field for field from
+# upstream: API v9 = TasksViewSerializer (2.x) / TaskSerializerV9 (3.x compat),
+# API v10 = TaskSerializerV10 (the 3.x default, task redesign #12584). v9 is a
+# plain list, v10 is paginated.
+
+def _v9_task(status, *, result=None, related_document=None):
+    return {
+        "id": 11,
+        "task_id": "t1",
+        "task_name": "consume_file",
+        "task_file_name": "x.pdf",
+        "type": "manual_task",
+        "status": status,
+        "date_created": "2026-10-31T10:00:00Z",
+        "date_done": "2026-10-31T10:00:05Z",
+        "result": result,
+        "acknowledged": False,
+        "related_document": related_document,
+        "duplicate_documents": [],
+        "owner": 2,
+    }
+
+
+def _v10_task(status, *, result_data=None, related_document_ids=None):
+    return {
+        "id": 11,
+        "task_id": "t1",
+        "task_type": "consume_file",
+        "task_type_display": "Consume File",
+        "trigger_source": "api_upload",
+        "trigger_source_display": "API Upload",
+        "status": status,
+        "status_display": status.capitalize(),
+        "date_created": "2026-10-31T10:00:00Z",
+        "date_started": "2026-10-31T10:00:01Z",
+        "date_done": "2026-10-31T10:00:05Z",
+        "duration_seconds": 4.0,
+        "wait_time_seconds": 1.0,
+        "input_data": {"filename": "x.pdf"},
+        "result_data": result_data,
+        "related_document_ids": related_document_ids or [],
+        "acknowledged": False,
+        "owner": 2,
+    }
+
+
+def _v10_task_poll_client(task_obj):
+    """Like ``_task_poll_client`` but with the paginated API v10 body."""
+    client = _task_poll_client(None)
+    client.get.return_value.json.return_value = {
+        "count": 1, "next": None, "previous": None, "results": [task_obj],
+    }
+    return client
+
+
+class TestPollTaskBothApiVersions:
+    """The consume outcome must read the same on Paperless-ngx 2.x and 3.x."""
+
+    # -- success with a document id --
+
+    @pytest.mark.asyncio
+    async def test_v9_success_with_document_id(self):
+        # The v9 serializer emits related_document as a STRING.
+        task = _v9_task("SUCCESS", result="Success. New document id 42 created",
+                        related_document="42")
+        out = await paperless._poll_task(_task_poll_client(task), "t1")
+        assert out == {"status": "success", "document_id": 42, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_v10_success_with_document_id(self):
+        task = _v10_task("success", result_data={"document_id": 42},
+                         related_document_ids=[42])
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {"status": "success", "document_id": 42, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_v10_success_without_document(self):
+        # A plugin stopped the consume (e.g. barcode split): success, no id.
+        task = _v10_task("success", result_data={"reason": "Barcode splitting complete!"})
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {"status": "success", "document_id": None, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_v10_several_ids_are_not_guessed(self):
+        # No known version emits more than one; picking one could PATCH the
+        # wrong document, so it reads as "no id" (caller falls back).
+        task = _v10_task("success", result_data={"document_id": 42},
+                         related_document_ids=[42, 43])
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {"status": "success", "document_id": None, "detail": None}
+
+    # -- duplicate failure --
+
+    @pytest.mark.asyncio
+    async def test_v9_duplicate_failure(self):
+        task = _v9_task(
+            "FAILURE",
+            result="x.pdf: Not consuming x.pdf: It is a duplicate of Rechnung (#7)",
+            related_document="7",
+        )
+        out = await paperless._poll_task(_task_poll_client(task), "t1")
+        assert out["status"] == "duplicate"
+        # related_document on a duplicate is the EXISTING doc, never a new id.
+        assert out["document_id"] is None
+        assert "duplicate" in out["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_v10_duplicate_failure(self):
+        task = _v10_task(
+            "failure",
+            result_data={"duplicate_of": 7, "duplicate_in_trash": False},
+            related_document_ids=[7],
+        )
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {
+            "status": "duplicate",
+            "document_id": None,
+            "detail": "Not consuming: It is a duplicate of document #7",
+        }
+
+    @pytest.mark.asyncio
+    async def test_v10_duplicate_in_trash(self):
+        task = _v10_task(
+            "failure",
+            result_data={"duplicate_of": 7, "duplicate_in_trash": True},
+            related_document_ids=[7],
+        )
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out["status"] == "duplicate"
+        assert out["document_id"] is None
+        assert "trash" in out["detail"]
+
+    @pytest.mark.asyncio
+    async def test_v10_duplicate_raised_as_exception(self):
+        # Defensive: no v3.3.4 path lets the duplicate error escape the plugin
+        # loop, but if one did, the failure handler would record it as
+        # error_type/error_message with the canonical text.
+        task = _v10_task(
+            "failure",
+            result_data={
+                "error_type": "ConsumeFileDuplicateError",
+                "error_message": "x.pdf: Not consuming x.pdf: It is a duplicate of R (#7)",
+            },
+        )
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out["status"] == "duplicate"
+
+    # -- other failure --
+
+    @pytest.mark.asyncio
+    async def test_v9_other_failure(self):
+        task = _v9_task("FAILURE", result="x.pdf: Error occurred while consuming document")
+        out = await paperless._poll_task(_task_poll_client(task), "t1")
+        assert out == {
+            "status": "failure",
+            "document_id": None,
+            "detail": "x.pdf: Error occurred while consuming document",
+        }
+
+    @pytest.mark.asyncio
+    async def test_v10_other_failure(self):
+        task = _v10_task(
+            "failure",
+            result_data={
+                "error_type": "ParseError",
+                "error_message": "cannot parse PDF",
+                "traceback": "Traceback (most recent call last): ...",
+            },
+        )
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {
+            "status": "failure",
+            "document_id": None,
+            "detail": "ParseError: cannot parse PDF",
+        }
+
+    @pytest.mark.asyncio
+    async def test_v10_failure_without_result_data(self):
+        task = _v10_task("failure", result_data=None)
+        out = await paperless._poll_task(_v10_task_poll_client(task), "t1")
+        assert out == {"status": "failure", "document_id": None, "detail": None}
+
+    @pytest.mark.asyncio
+    async def test_back_compat_wrapper_on_v10(self):
+        task = _v10_task("success", result_data={"document_id": 9},
+                         related_document_ids=[9])
+        assert await paperless._poll_task_for_document_id(
+            _v10_task_poll_client(task), "t1"
+        ) == 9
+
+
+class TestIsDuplicateFailureResultData:
+    def test_structured_duplicate(self):
+        assert paperless._is_duplicate_failure({"duplicate_of": 7, "duplicate_in_trash": False})
+
+    def test_duplicate_of_zero_is_still_a_duplicate(self):
+        # Presence of the key decides, not its truthiness.
+        assert paperless._is_duplicate_failure({"duplicate_of": 0})
+
+    def test_error_message_marker(self):
+        assert paperless._is_duplicate_failure(
+            {"error_type": "X", "error_message": "It is a duplicate of R (#7)"}
+        )
+
+    def test_other_error_is_not_a_duplicate(self):
+        assert not paperless._is_duplicate_failure(
+            {"error_type": "ParseError", "error_message": "cannot parse PDF"}
+        )
+
+    def test_empty_and_non_string_message(self):
+        assert not paperless._is_duplicate_failure({})
+        assert not paperless._is_duplicate_failure({"error_message": None})
+        assert not paperless._is_duplicate_failure({"error_message": 5})
+
+
 class TestAwaitConsumeResult:
     @pytest.mark.asyncio
     async def test_missing_url_errors(self, monkeypatch):

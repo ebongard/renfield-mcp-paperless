@@ -8,6 +8,8 @@ Replaces other MCP Servers which might return full document objects including OC
 
 - Uses Paperless `?fields=id,title,correspondent,document_type,storage_path` for server-side field selection
 - Resolves integer IDs to human-readable names (e.g. correspondent `178` → `"IONOS SE"`)
+- Resolves names back to IDs for filters and writes. Tags match exactly (case-insensitive); correspondents, document types and storage paths also accept a substring when exactly one entry matches. Two candidates give an `Ambiguous …` error that names them, never a guess.
+- Keeps the taxonomy (correspondents, document types, storage paths, tags) cached per process, and reloads one dimension when a name or an id misses. An entry created in the Paperless UI is therefore found without a restart. The `list_*` tools always read fresh.
 - Returns compact results (~100-200 bytes per document vs ~2-3KB)
 - Supports pagination
 

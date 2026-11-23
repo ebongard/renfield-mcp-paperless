@@ -1,6 +1,7 @@
 """
 Tests for renfield-mcp-paperless MCP server.
 """
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,6 +32,33 @@ def _set_env(monkeypatch):
     # Reload module-level constants
     monkeypatch.setattr(paperless, "PAPERLESS_API_URL", "http://your-paperless-url")
     monkeypatch.setattr(paperless, "PAPERLESS_API_TOKEN", "test-token-abc")
+
+
+def _serve_taxonomy(client):
+    """Let ``client.get`` answer taxonomy listings with what the module caches
+    hold right now — i.e. "Paperless has exactly what the cache has".
+
+    Resolution refreshes a dimension on a miss and the ``list_*`` tools always
+    read fresh, so a test that pre-seeds the caches has to say what Paperless
+    returns on that read. Any other GET is a test bug and fails loudly.
+    """
+    state = {dim: dict(paperless._get_cache(dim) or {}) for dim in paperless._TAXONOMY}
+
+    async def _get(url, *args, **kwargs):
+        for dim, (endpoint, _fields, _label) in paperless._TAXONOMY.items():
+            if f"/api/{endpoint}/" in url:
+                resp = MagicMock()
+                resp.raise_for_status = MagicMock()
+                key = "path" if dim == "storage_path" else "name"
+                resp.json.return_value = {
+                    "results": [{"id": i, key: n, "name": n} for i, n in state[dim].items()],
+                    "next": None,
+                }
+                return resp
+        raise AssertionError(f"unexpected GET {url}")
+
+    client.get = AsyncMock(side_effect=_get)
+    return client
 
 
 # ── _resolve_name_to_id ─────────────────────────────────────────
@@ -1081,12 +1109,20 @@ class TestUploadDocument:
         paperless._tag_cache = {}
         paperless._storage_path_cache = {}
 
-        result = await paperless.upload_document(
-            title="Test",
-            file_content_base64=b64,
-            correspondent="DoesNotExist",
-        )
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.post = AsyncMock()
+        _serve_taxonomy(client)  # Paperless has only "Telekom"
 
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.upload_document(
+                title="Test",
+                file_content_base64=b64,
+                correspondent="DoesNotExist",
+            )
+
+        client.post.assert_not_called()  # refused before any upload
         assert "error" in result
         assert "Unknown correspondent" in result["error"]
         assert "DoesNotExist" in result["error"]
@@ -1455,6 +1491,7 @@ class TestUpdateDocument:
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
+            _serve_taxonomy(instance)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -1473,6 +1510,7 @@ class TestUpdateDocument:
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
+            _serve_taxonomy(instance)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -1491,6 +1529,7 @@ class TestUpdateDocument:
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
+            _serve_taxonomy(instance)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -1881,6 +1920,7 @@ class TestUpdateDocumentStoragePath:
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
+            _serve_taxonomy(instance)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -2065,6 +2105,7 @@ class TestListStoragePaths:
 
         with patch("httpx.AsyncClient") as MockClient:
             instance = AsyncMock()
+            _serve_taxonomy(instance)
             instance.__aenter__ = AsyncMock(return_value=instance)
             instance.__aexit__ = AsyncMock(return_value=False)
             MockClient.return_value = instance
@@ -2765,6 +2806,9 @@ class TestUploadDocumentExtendedFields:
                 _mk_taxonomy_resp([]),  # document_types
                 _mk_taxonomy_resp([{"id": 1, "path": "/inbox"}]),
                 _mk_taxonomy_resp([]),  # tags
+                # the miss refreshes storage paths once — Paperless still
+                # has no such path, so the upload still fails fast
+                _mk_taxonomy_resp([{"id": 1, "path": "/inbox"}]),
             ]
         )
         client.patch = AsyncMock()
@@ -3025,6 +3069,7 @@ class TestCreateCorrespondent:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(
             return_value=_mk_created_resp({"id": 42, "name": "Stadtwerke Köln"})
         )
@@ -3086,6 +3131,7 @@ class TestCreateCorrespondent:
         bad_resp.raise_for_status = MagicMock()
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(return_value=bad_resp)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
@@ -3110,6 +3156,7 @@ class TestCreateDocumentType:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(
             return_value=_mk_created_resp({"id": 11, "name": "Quittung"})
         )
@@ -3152,6 +3199,7 @@ class TestCreateTag:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(
             return_value=_mk_created_resp(
                 {"id": 8, "name": "steuer-2026", "color": "#a6cee3"}
@@ -3179,6 +3227,7 @@ class TestCreateTag:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(
             return_value=_mk_created_resp({"id": 9, "name": "privat"})
         )
@@ -3221,6 +3270,7 @@ class TestCreateStoragePath:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.post = AsyncMock(
             return_value=_mk_created_resp(
                 {"id": 2, "name": "Steuer 2025", "path": "/steuer/{created_year}"}
@@ -3253,6 +3303,7 @@ class TestCreateStoragePath:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
 
@@ -3280,9 +3331,9 @@ class TestListCorrespondents:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        client.get = AsyncMock()  # cache warm, no fetches expected
 
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.list_correspondents()
@@ -3302,9 +3353,9 @@ class TestListCorrespondents:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        client.get = AsyncMock()
 
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.list_correspondents()
@@ -3327,9 +3378,9 @@ class TestListDocumentTypes:
         paperless._tag_cache = {}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        client.get = AsyncMock()
 
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.list_document_types()
@@ -3357,9 +3408,9 @@ class TestListTags:
         paperless._tag_cache = {100: "wohnung", 101: "steuer-2025"}
 
         client = AsyncMock()
+        _serve_taxonomy(client)
         client.__aenter__ = AsyncMock(return_value=client)
         client.__aexit__ = AsyncMock(return_value=False)
-        client.get = AsyncMock()
 
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.list_tags()
@@ -3414,12 +3465,14 @@ class TestListTags:
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.list_tags()
 
-        # Cache got populated; list_tags returns the one tag.
+        # list_tags reads the TAG dimension fresh and returns it ...
         assert result == {"items": [{"id": 4, "name": "D"}]}
-        # And the other caches got populated too — parallel fetch.
-        assert paperless._correspondent_cache == {1: "A"}
-        assert paperless._document_type_cache == {2: "B"}
-        assert paperless._storage_path_cache == {3: "/x"}
+        assert paperless._tag_cache == {4: "D"}
+        # ... and leaves the other dimensions alone: a listing of tags is no
+        # reason to pull three other taxonomies.
+        assert paperless._correspondent_cache is None
+        assert paperless._document_type_cache is None
+        assert paperless._storage_path_cache is None
 
 
 # ── consume-task polling + duplicate detection (folder-ingest T5/T10) ──────
@@ -4816,3 +4869,189 @@ class TestIndexHttpHelpers:
         client = AsyncMock()
         client.get = AsyncMock(return_value=_idx_resp(status=403))
         assert await paperless._index_status(client) == (None, None)
+
+
+# ── taxonomy freshness + unambiguous resolution ─────────────────────────────
+#
+# The taxonomy caches live for the whole process. A tag created in the
+# Paperless UI (or by the document worker's own copy of this server) was
+# "Unknown tags" here until a restart although it existed — and a tag name
+# could silently resolve to a DIFFERENT tag by substring.
+
+
+def _client_serving(**dims):
+    """A mock client whose GETs answer with the given Paperless state
+    (``tag={id: name}`` …), counting calls per endpoint."""
+    client = AsyncMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    calls: dict[str, int] = {}
+
+    async def _get(url, *args, **kwargs):
+        for dim, (endpoint, _f, _l) in paperless._TAXONOMY.items():
+            if f"/api/{endpoint}/" in url:
+                calls[dim] = calls.get(dim, 0) + 1
+                resp = MagicMock()
+                resp.raise_for_status = MagicMock()
+                key = "path" if dim == "storage_path" else "name"
+                resp.json.return_value = {
+                    "results": [{"id": i, key: n, "name": n} for i, n in dims.get(dim, {}).items()],
+                    "next": None,
+                }
+                return resp
+        raise AssertionError(f"unexpected GET {url}")
+
+    client.get = AsyncMock(side_effect=_get)
+    client.calls = calls
+    return client
+
+
+def _seed(**dims):
+    paperless._correspondent_cache = dict(dims.get("correspondent", {}))
+    paperless._document_type_cache = dict(dims.get("document_type", {}))
+    paperless._storage_path_cache = dict(dims.get("storage_path", {}))
+    paperless._tag_cache = dict(dims.get("tag", {}))
+
+
+class TestTaxonomyRefreshOnMiss:
+    @pytest.mark.asyncio
+    async def test_tag_created_elsewhere_is_found_without_restart(self):
+        """The reported bug: the cache predates the tag; Paperless has it."""
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat", 2: "neu-angelegt"})
+        patch_resp = MagicMock(status_code=200)
+        patch_resp.json.return_value = {"id": 42, "title": "x", "tags": [1, 2]}
+        patch_resp.raise_for_status = MagicMock()
+        client.patch = AsyncMock(return_value=patch_resp)
+
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.update_document(42, tags=["privat", "neu-angelegt"])
+
+        assert "error" not in result, result
+        assert client.patch.await_args.kwargs["json"]["tags"] == [1, 2]
+        assert paperless._tag_cache == {1: "privat", 2: "neu-angelegt"}
+
+    @pytest.mark.asyncio
+    async def test_a_hit_costs_no_request(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat"})
+        with patch("httpx.AsyncClient", return_value=client):
+            ids, unresolved = await paperless._resolve_tags(client, ["privat"])
+        assert (ids, unresolved) == ([1], [])
+        client.get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_many_misses_refresh_the_tags_once(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat"})
+        ids, unresolved = await paperless._resolve_tags(client, ["a", "b", "c"])
+        assert (ids, unresolved) == ([], ["a", "b", "c"])
+        assert client.calls == {"tag": 1}
+
+    @pytest.mark.asyncio
+    async def test_a_true_unknown_stays_unknown_after_the_refresh(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.update_document(42, tags=["gibt-es-nicht"])
+        assert "gibt-es-nicht" in result["error"]
+        client.patch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_correspondent_created_elsewhere_is_found(self):
+        _seed(correspondent={1: "Stadtwerke"})
+        client = _client_serving(correspondent={1: "Stadtwerke", 2: "Neue Bank"})
+        assert await paperless._resolve(client, "correspondent", "Neue Bank") == 2
+        assert client.calls == {"correspondent": 1}
+
+    @pytest.mark.asyncio
+    async def test_refresh_never_leaves_an_empty_window(self):
+        """While the reload is in flight a concurrent reader still sees the old
+        copy — never None/{} (it rendered documents without their tags)."""
+        _seed(tag={1: "privat"})
+        gate = asyncio.Event()
+        seen: list = []
+
+        client = _client_serving(tag={1: "privat", 2: "neu"})
+        inner = client.get.side_effect
+
+        async def _slow_get(url, *a, **k):
+            seen.append(paperless._tag_cache)  # mid-flight view
+            await gate.wait()
+            return await inner(url, *a, **k)
+
+        client.get = AsyncMock(side_effect=_slow_get)
+        task = asyncio.create_task(paperless._refresh(client, "tag"))
+        await asyncio.sleep(0)
+        assert paperless._tag_cache == {1: "privat"}
+        gate.set()
+        await task
+        assert seen == [{1: "privat"}]
+        assert paperless._tag_cache == {1: "privat", 2: "neu"}
+
+
+class TestListingsReadFresh:
+    @pytest.mark.asyncio
+    async def test_list_tags_shows_a_tag_created_elsewhere(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat", 2: "neu"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_tags()
+        assert result == {"items": [{"id": 1, "name": "privat"}, {"id": 2, "name": "neu"}]}
+
+    @pytest.mark.asyncio
+    async def test_list_correspondents_shows_a_deleted_one_gone(self):
+        _seed(correspondent={1: "Alt", 2: "Bleibt"})
+        client = _client_serving(correspondent={2: "Bleibt"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.list_correspondents()
+        assert result == {"items": [{"id": 2, "name": "Bleibt"}]}
+
+
+class TestUnambiguousResolution:
+    def test_tag_never_resolves_by_substring(self):
+        cache = {1: "Autoversicherung"}
+        assert paperless._resolve_name_to_id("Auto", cache, substring=False) is None
+        assert paperless._resolve_tags_to_ids(["Auto"], cache) == []
+
+    def test_tag_case_insensitive_still_resolves(self):
+        assert paperless._resolve_tags_to_ids(["PRIVAT"], {7: "privat"}) == [7]
+
+    def test_ambiguous_substring_resolves_to_nothing(self):
+        cache = {1: "Telekom Deutschland GmbH", 2: "Telekom Mobilfunk"}
+        assert paperless._resolve_name_to_id("Telekom", cache) is None
+
+    def test_unique_substring_still_resolves_for_organisations(self):
+        cache = {1: "Telekom Deutschland GmbH", 2: "Stadtwerke"}
+        assert paperless._resolve_name_to_id("Telekom", cache) == 1
+
+    @pytest.mark.asyncio
+    async def test_create_tag_is_not_blocked_by_a_longer_tag(self):
+        """'Auto' used to come back as already_exists → 'Autoversicherung', and
+        the folder ingest filed the document under the wrong tag."""
+        _seed(tag={1: "Autoversicherung"})
+        client = _client_serving(tag={1: "Autoversicherung"})
+        client.post = AsyncMock(return_value=_mk_created_resp({"id": 9, "name": "Auto"}))
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_tag("Auto")
+        assert result["id"] == 9
+        client.post.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_create_tag_sees_an_existing_tag_created_elsewhere(self):
+        _seed(tag={})
+        client = _client_serving(tag={5: "steuer"})
+        client.post = AsyncMock()
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_tag("Steuer")
+        assert result == {"error": "already_exists", "existing_id": 5, "existing_name": "steuer"}
+        client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_search_with_an_unknown_tag_refuses_instead_of_ignoring(self):
+        """An unresolved tag used to be dropped, returning ALL documents."""
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.search_documents(tags=["gibt-es-nicht"])
+        assert "gibt-es-nicht" in result["error"]

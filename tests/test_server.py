@@ -5307,6 +5307,25 @@ class TestModifyDocumentTags:
         client.post.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_same_tag_in_other_case_on_both_sides_is_refused(self):
+        _seed(tag={1: "Steuer"})
+        client = _bulk_client(tag={1: "Steuer"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags(
+                [5], add_tags=["steuer"], remove_tags=["STEUER"])
+        assert result == {"error": "Tags both added and removed: ['steuer']"}
+        client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_spellings_of_one_tag_send_its_id_once(self):
+        _seed(tag={1: "Steuer", 2: "b"})
+        client = _bulk_client(tag={1: "Steuer", 2: "b"})
+        with patch("httpx.AsyncClient", return_value=client):
+            await paperless.modify_document_tags([5], add_tags=["Steuer", "steuer"], remove_tags=["b"])
+        assert client.post.await_args.kwargs["json"]["parameters"] == {
+            "add_tags": [1], "remove_tags": [2]}
+
+    @pytest.mark.asyncio
     async def test_missing_document_reports_paperless_reason(self):
         _seed(tag={1: "a"})
         client = _bulk_client(

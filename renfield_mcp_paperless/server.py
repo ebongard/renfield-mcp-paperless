@@ -1535,7 +1535,13 @@ async def modify_document_tags(
         tag_ids, unresolved = await _resolve_tags(client, add + remove)
         if unresolved:
             return {"error": f"Unknown tags: {unresolved}"}
-        add_ids, remove_ids = tag_ids[: len(add)], tag_ids[len(add):]
+        add_ids = list(dict.fromkeys(tag_ids[: len(add)]))
+        remove_ids = list(dict.fromkeys(tag_ids[len(add):]))
+        # Names match case-insensitively, so "Steuer" and "steuer" are one tag.
+        clash = set(add_ids) & set(remove_ids)
+        if clash:
+            names = [n for n, i in zip(add, tag_ids[: len(add)]) if i in clash]
+            return {"error": f"Tags both added and removed: {names}"}
         resp = await client.post(
             f"{PAPERLESS_API_URL}/api/documents/bulk_edit/",
             headers={**_headers(), "Content-Type": "application/json"},

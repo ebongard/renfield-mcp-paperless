@@ -1389,7 +1389,10 @@ async def update_document(
         title: New document title
         correspondent: Correspondent name (must exist in Paperless)
         document_type: Document type name (must exist in Paperless)
-        tags: List of tag names (must exist in Paperless)
+        tags: The COMPLETE new tag list (must exist in Paperless). It
+            REPLACES every tag the document has — a tag left out is removed.
+            To add or remove tags while keeping the others, use
+            ``modify_document_tags`` instead (also for a single document).
         created_date: Document creation date (YYYY-MM-DD)
         storage_path: Storage path name (must exist in Paperless)
         custom_fields: List of custom field dicts [{field: id, value: ...}]
@@ -1472,6 +1475,85 @@ async def update_document(
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
         "storage_path": (_storage_path_cache or {}).get(doc.get("storage_path")) if doc.get("storage_path") else None,
+    }
+
+
+def _bulk_edit_error(resp: httpx.Response) -> str:
+    """The reason Paperless gave for refusing a bulk edit, as one line."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = resp.text
+    if isinstance(body, dict):
+        parts = []
+        for key, val in body.items():
+            msgs = val if isinstance(val, list) else [val]
+            parts.append(f"{key}: {'; '.join(str(m) for m in msgs)}")
+        body = ", ".join(parts)
+    return f"Paperless refused the tag change (HTTP {resp.status_code}): {body}"
+
+
+@mcp.tool()
+async def modify_document_tags(
+    document_ids: list[int],
+    add_tags: list[str] | None = None,
+    remove_tags: list[str] | None = None,
+) -> dict:
+    """Add and/or remove tags on one or many documents in ONE call, keeping
+    every other tag the documents already have.
+
+    Use this to tag documents — never call ``update_document`` once per
+    document for it: ``update_document(tags=…)`` REPLACES the whole tag list.
+    One call covers any number of documents (Paperless bulk edit).
+
+    Args:
+        document_ids: Paperless document IDs to change (one or many).
+        add_tags: Tag names to add (exact names; must exist in Paperless).
+        remove_tags: Tag names to remove (exact names; must exist in Paperless).
+
+    Returns ``{"modified": n, "document_ids": [...], "added_tags": [...],
+    "removed_tags": [...]}``, or ``{"error": ...}`` — nothing is changed when
+    a tag is unknown, a document does not exist or the token may not edit it.
+    """
+    if not PAPERLESS_API_URL:
+        return {"error": "PAPERLESS_API_URL not configured"}
+    if not PAPERLESS_API_TOKEN:
+        return {"error": "PAPERLESS_API_TOKEN not configured"}
+
+    ids = list(dict.fromkeys(document_ids or []))
+    add = list(dict.fromkeys(add_tags or []))
+    remove = list(dict.fromkeys(remove_tags or []))
+    if not ids:
+        return {"error": "No document_ids given"}
+    if not add and not remove:
+        return {"error": "Nothing to change: give add_tags and/or remove_tags"}
+    both = sorted(set(add) & set(remove))
+    if both:
+        return {"error": f"Tags both added and removed: {both}"}
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        tag_ids, unresolved = await _resolve_tags(client, add + remove)
+        if unresolved:
+            return {"error": f"Unknown tags: {unresolved}"}
+        add_ids, remove_ids = tag_ids[: len(add)], tag_ids[len(add):]
+        resp = await client.post(
+            f"{PAPERLESS_API_URL}/api/documents/bulk_edit/",
+            headers={**_headers(), "Content-Type": "application/json"},
+            json={
+                "documents": ids,
+                "method": "modify_tags",
+                "parameters": {"add_tags": add_ids, "remove_tags": remove_ids},
+            },
+        )
+        if resp.status_code in (400, 403):
+            return {"error": _bulk_edit_error(resp)}
+        resp.raise_for_status()
+
+    return {
+        "modified": len(ids),
+        "document_ids": ids,
+        "added_tags": add,
+        "removed_tags": remove,
     }
 
 

@@ -5200,3 +5200,169 @@ class TestNoCreateFlushesACache:
         assert result["id"] == 9
         for dim in paperless._TAXONOMY:
             assert paperless._get_cache(dim) is not None, dim
+
+
+# ── modify_document_tags ────────────────────────────────────────
+# 2026-11-23: tagging 15 documents meant 15 update_document calls — the agent's
+# same-tool guard stopped the turn after 5, and ``update_document(tags=…)``
+# REPLACES the tag list, so two of the five lost a tag they already had.
+
+
+def _bulk_client(status=200, body=None, **dims):
+    client = _client_serving(**dims)
+    resp = MagicMock(status_code=status)
+    resp.json.return_value = body if body is not None else {"result": "OK"}
+    resp.text = json.dumps(resp.json.return_value)
+    resp.raise_for_status = MagicMock(
+        side_effect=None if status < 400 else httpx.HTTPStatusError(
+            "boom", request=MagicMock(), response=resp))
+    client.post = AsyncMock(return_value=resp)
+    client.patch = AsyncMock(side_effect=AssertionError("must not PATCH"))
+    return client
+
+
+class TestModifyDocumentTags:
+    @pytest.mark.asyncio
+    async def test_many_documents_one_bulk_call_add_only(self):
+        _seed(tag={1: "privat", 2: "steuer"})
+        client = _bulk_client(tag={1: "privat", 2: "steuer"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags(
+                list(range(100, 115)), add_tags=["steuer"])
+
+        assert result == {"modified": 15, "document_ids": list(range(100, 115)),
+                          "added_tags": ["steuer"], "removed_tags": []}
+        client.post.assert_awaited_once()
+        call = client.post.await_args
+        assert call.args[0].endswith("/api/documents/bulk_edit/")
+        assert call.kwargs["json"] == {
+            "documents": list(range(100, 115)),
+            "method": "modify_tags",
+            "parameters": {"add_tags": [2], "remove_tags": []},
+        }
+
+    @pytest.mark.asyncio
+    async def test_add_and_remove_map_to_their_own_ids(self):
+        _seed(tag={1: "a", 2: "b", 3: "c"})
+        client = _bulk_client(tag={1: "a", 2: "b", 3: "c"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags(
+                [7], add_tags=["c", "a"], remove_tags=["b"])
+        assert "error" not in result, result
+        assert client.post.await_args.kwargs["json"]["parameters"] == {
+            "add_tags": [3, 1], "remove_tags": [2]}
+
+    @pytest.mark.asyncio
+    async def test_duplicates_are_collapsed(self):
+        _seed(tag={1: "a"})
+        client = _bulk_client(tag={1: "a"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([5, 5, 6], add_tags=["a", "a"])
+        body = client.post.await_args.kwargs["json"]
+        assert body["documents"] == [5, 6]
+        assert body["parameters"]["add_tags"] == [1]
+        assert result["modified"] == 2
+
+    @pytest.mark.asyncio
+    async def test_unknown_tag_changes_nothing(self):
+        _seed(tag={1: "a"})
+        client = _bulk_client(tag={1: "a"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([5], add_tags=["fehlt"])
+        assert result == {"error": "Unknown tags: ['fehlt']"}
+        client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_tag_created_elsewhere_is_found(self):
+        """Same refresh-on-miss as update_document (#19)."""
+        _seed(tag={1: "a"})
+        client = _bulk_client(tag={1: "a", 2: "neu"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([5], add_tags=["neu"])
+        assert "error" not in result, result
+        assert client.post.await_args.kwargs["json"]["parameters"]["add_tags"] == [2]
+
+    @pytest.mark.asyncio
+    async def test_tag_resolves_exactly_never_by_substring(self):
+        _seed(tag={1: "Steuer 2025"})
+        client = _bulk_client(tag={1: "Steuer 2025"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([5], add_tags=["Steuer"])
+        assert "error" in result
+        client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kwargs, msg", [
+        ({"document_ids": [], "add_tags": ["a"]}, "No document_ids"),
+        ({"document_ids": [1]}, "Nothing to change"),
+        ({"document_ids": [1], "add_tags": [], "remove_tags": []}, "Nothing to change"),
+        ({"document_ids": [1], "add_tags": ["a"], "remove_tags": ["a"]}, "both added and removed"),
+    ])
+    async def test_invalid_requests_never_reach_paperless(self, kwargs, msg):
+        _seed(tag={1: "a"})
+        client = _bulk_client(tag={1: "a"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags(**kwargs)
+        assert msg in result["error"]
+        client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_tag_in_other_case_on_both_sides_is_refused(self):
+        _seed(tag={1: "Steuer"})
+        client = _bulk_client(tag={1: "Steuer"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags(
+                [5], add_tags=["steuer"], remove_tags=["STEUER"])
+        assert result == {"error": "Tags both added and removed: ['steuer']"}
+        client.post.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_spellings_of_one_tag_send_its_id_once(self):
+        _seed(tag={1: "Steuer", 2: "b"})
+        client = _bulk_client(tag={1: "Steuer", 2: "b"})
+        with patch("httpx.AsyncClient", return_value=client):
+            await paperless.modify_document_tags([5], add_tags=["Steuer", "steuer"], remove_tags=["b"])
+        assert client.post.await_args.kwargs["json"]["parameters"] == {
+            "add_tags": [1], "remove_tags": [2]}
+
+    @pytest.mark.asyncio
+    async def test_missing_document_reports_paperless_reason(self):
+        _seed(tag={1: "a"})
+        client = _bulk_client(
+            status=400, body={"documents": ["Some documents don't exist or were specified twice."]},
+            tag={1: "a"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([999999], add_tags=["a"])
+        assert "HTTP 400" in result["error"]
+        assert "don't exist" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_forbidden_is_an_error_not_a_raise(self):
+        _seed(tag={1: "a"})
+        client = _bulk_client(status=403, tag={1: "a"})
+        client.post.return_value.json.side_effect = ValueError("not json")
+        client.post.return_value.text = "Insufficient permissions"
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.modify_document_tags([5], add_tags=["a"])
+        assert "HTTP 403" in result["error"]
+        assert "Insufficient permissions" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_server_error_raises(self):
+        _seed(tag={1: "a"})
+        client = _bulk_client(status=500, tag={1: "a"})
+        with patch("httpx.AsyncClient", return_value=client):
+            with pytest.raises(httpx.HTTPStatusError):
+                await paperless.modify_document_tags([5], add_tags=["a"])
+
+    @pytest.mark.asyncio
+    async def test_missing_config(self, monkeypatch):
+        monkeypatch.setattr(paperless, "PAPERLESS_API_URL", "")
+        assert "error" in await paperless.modify_document_tags([1], add_tags=["a"])
+
+
+class TestUpdateDocumentTagsDocumentReplace:
+    def test_update_document_says_tags_replace_and_names_the_bulk_tool(self):
+        doc = paperless.update_document.__doc__ if callable(paperless.update_document) else ""
+        doc = doc or getattr(paperless.update_document, "description", "") or ""
+        assert "REPLACES" in doc and "modify_document_tags" in doc

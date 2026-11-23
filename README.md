@@ -80,6 +80,24 @@ python -m renfield_mcp_paperless
 }
 ```
 
+## Tool: `modify_document_tags`
+
+Adds and/or removes tags on one or many documents in one call (Paperless
+`bulk_edit`, method `modify_tags`). Every other tag a document has stays.
+
+| Parameter      | Type      | Default | Description                              |
+|----------------|-----------|---------|------------------------------------------|
+| `document_ids` | list[int] | —       | Documents to change (one or many)        |
+| `add_tags`     | list[str] | `[]`    | Tag names to add (exact, must exist)     |
+| `remove_tags`  | list[str] | `[]`    | Tag names to remove (exact, must exist)  |
+
+Response: `{"modified": 15, "document_ids": [...], "added_tags": [...], "removed_tags": [...]}`.
+Nothing changes when a tag is unknown, a document does not exist, or the token
+may not edit it; the error carries the reason Paperless gave.
+
+**Use this to tag documents, not `update_document`.** `update_document(tags=…)`
+sets the COMPLETE tag list and removes every tag it does not name.
+
 ## Tool: `search_index_health`
 
 Checks whether the Paperless full-text **search index** contains the documents in the

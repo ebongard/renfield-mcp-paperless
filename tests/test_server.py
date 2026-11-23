@@ -5,6 +5,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from renfield_mcp_paperless import server as paperless
@@ -5114,3 +5115,88 @@ class TestAmbiguousNames:
         assert result["error"] == "already_exists"
         assert result["existing_id"] == 1
         client.post.assert_not_called()
+
+
+class TestIdToNameOnEveryRender:
+    """Re-review of #19: the refresh must be wired into EVERY render path, and a
+    failed refresh must not turn a done write into an error."""
+
+    @staticmethod
+    def _client(doc_routes: dict, **taxonomy):
+        client = _client_serving(**taxonomy)
+        taxonomy_get = client.get.side_effect
+
+        async def _get(url, *a, **k):
+            for part, body in doc_routes.items():
+                if part in url:
+                    resp = MagicMock(status_code=200)
+                    resp.raise_for_status = MagicMock()
+                    resp.json.return_value = body
+                    return resp
+            return await taxonomy_get(url, *a, **k)
+
+        client.get = AsyncMock(side_effect=_get)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_search_names_a_tag_created_elsewhere(self):
+        _seed(tag={1: "privat"})
+        client = self._client(
+            {"/api/documents/": {"count": 1, "next": None,
+                                 "results": [{"id": 7, "title": "t", "tags": [1, 2]}]}},
+            tag={1: "privat", 2: "ui-tag"},
+        )
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.search_documents(query="t")
+        assert result["results"][0]["tags"] == ["privat", "ui-tag"]
+
+    @pytest.mark.asyncio
+    async def test_update_response_names_a_tag_created_elsewhere(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat", 2: "ui-tag"})
+        patch_resp = MagicMock(status_code=200)
+        patch_resp.raise_for_status = MagicMock()
+        patch_resp.json.return_value = {"id": 42, "title": "neu", "tags": [1, 2]}
+        client.patch = AsyncMock(return_value=patch_resp)
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.update_document(42, title="neu")
+        assert result["tags"] == ["privat", "ui-tag"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_refresh_does_not_fail_a_done_update(self):
+        _seed(tag={1: "privat"})
+        client = AsyncMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(side_effect=httpx.ConnectTimeout("tags endpoint down"))
+        patch_resp = MagicMock(status_code=200)
+        patch_resp.raise_for_status = MagicMock()
+        patch_resp.json.return_value = {"id": 42, "title": "neu", "tags": [1, 2]}
+        client.patch = AsyncMock(return_value=patch_resp)
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.update_document(42, title="neu")
+        assert "error" not in result
+        assert result["title"] == "neu"
+        assert result["tags"] == ["privat"]  # what is known; the write stands
+
+
+class TestNoCreateFlushesACache:
+    """The concurrency claim rests on "nothing sets a loaded cache to None" —
+    guard it for every create_* tool."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool,args,created", [
+        ("create_correspondent", ("Neu",), {"id": 9, "name": "Neu"}),
+        ("create_document_type", ("Neu",), {"id": 9, "name": "Neu"}),
+        ("create_tag", ("neu",), {"id": 9, "name": "neu", "color": None}),
+        ("create_storage_path", ("Neu", "/neu/{created_year}"), {"id": 9, "name": "Neu", "path": "/neu/{created_year}"}),
+    ])
+    async def test_every_dimension_stays_loaded(self, tool, args, created):
+        _seed(correspondent={1: "A"}, document_type={2: "B"}, storage_path={3: "/c"}, tag={4: "d"})
+        client = _client_serving(correspondent={1: "A"}, document_type={2: "B"}, storage_path={3: "/c"}, tag={4: "d"})
+        client.post = AsyncMock(return_value=_mk_created_resp(created))
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await getattr(paperless, tool)(*args)
+        assert result["id"] == 9
+        for dim in paperless._TAXONOMY:
+            assert paperless._get_cache(dim) is not None, dim

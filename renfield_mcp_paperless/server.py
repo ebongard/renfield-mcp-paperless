@@ -317,8 +317,18 @@ async def _ensure_ids_known(client: httpx.AsyncClient, docs: list[dict]) -> None
             value = doc.get(field)
             if value and value not in _cache_of(dim):
                 stale.add(dim)
-    if stale:
+    if not stale:
+        return
+    try:
         await asyncio.gather(*(_refresh(client, d) for d in sorted(stale)))
+    except httpx.HTTPError as exc:
+        # A render must not fail on a taxonomy hiccup — least of all the
+        # response of update_document, whose PATCH has already gone through.
+        # Render with the names known so far; the next miss tries again.
+        logger.warning(
+            "Taxonomy refresh before rendering failed (%s): %s",
+            ",".join(sorted(stale)), type(exc).__name__,
+        )
 
 
 # --- Auto-pagination helper ---

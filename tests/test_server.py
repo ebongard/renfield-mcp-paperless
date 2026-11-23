@@ -2355,43 +2355,32 @@ class TestUploadDocumentBase64Validation:
         assert mock.post.call_count == 1
 
 
-# ── _invalidate_cache ────────────────────────────────────────────
+# ── _remember_created ────────────────────────────────────────────
 
 
-class TestInvalidateCache:
-    def test_invalidates_correspondent_only(self):
+class TestRememberCreated:
+    """A create adds its entry to a COPY swapped in whole — the dimension is
+    never flushed to None (a concurrent reader rendered names away)."""
+
+    def test_adds_to_one_dimension_only(self):
         paperless._correspondent_cache = {1: "A"}
         paperless._document_type_cache = {2: "B"}
         paperless._tag_cache = {3: "C"}
         paperless._storage_path_cache = {4: "D"}
+        before = paperless._tag_cache
 
-        paperless._invalidate_cache("correspondent")
+        paperless._remember_created("tag", 9, "neu")
 
-        assert paperless._correspondent_cache is None
+        assert paperless._tag_cache == {3: "C", 9: "neu"}
+        assert before == {3: "C"}  # the old dict object was not mutated in place
+        assert paperless._correspondent_cache == {1: "A"}
         assert paperless._document_type_cache == {2: "B"}
-        assert paperless._tag_cache == {3: "C"}
         assert paperless._storage_path_cache == {4: "D"}
 
-    def test_invalidates_document_type_only(self):
-        paperless._correspondent_cache = {1: "A"}
-        paperless._document_type_cache = {2: "B"}
-        paperless._invalidate_cache("document_type")
-        assert paperless._document_type_cache is None
-        assert paperless._correspondent_cache == {1: "A"}
-
-    def test_invalidates_tag_only(self):
-        paperless._tag_cache = {1: "A"}
-        paperless._storage_path_cache = {2: "B"}
-        paperless._invalidate_cache("tag")
-        assert paperless._tag_cache is None
-        assert paperless._storage_path_cache == {2: "B"}
-
-    def test_invalidates_storage_path_only(self):
-        paperless._storage_path_cache = {1: "A"}
-        paperless._correspondent_cache = {2: "B"}
-        paperless._invalidate_cache("storage_path")
-        assert paperless._storage_path_cache is None
-        assert paperless._correspondent_cache == {2: "B"}
+    def test_an_unloaded_dimension_stays_unloaded(self):
+        paperless._tag_cache = None
+        paperless._remember_created("tag", 9, "neu")
+        assert paperless._tag_cache is None  # the next _ensure_caches loads it whole
 
 
 # ── _ensure_caches: parallel fetches ─────────────────────────────
@@ -2458,7 +2447,7 @@ class TestEnsureCachesParallel:
         paperless._storage_path_cache = {3: "existing"}
         paperless._tag_cache = {4: "existing"}
 
-        paperless._invalidate_cache("correspondent")
+        paperless._set_cache("correspondent", None)
 
         hit_urls: list[str] = []
 
@@ -3081,7 +3070,7 @@ class TestCreateCorrespondent:
 
         assert result == {"id": 42, "name": "Stadtwerke Köln"}
         # Cache was invalidated on success.
-        assert paperless._correspondent_cache is None
+        assert paperless._correspondent_cache == {1: "Existing", 42: "Stadtwerke Köln"}  # added, never flushed
         assert client.post.await_count == 1
 
     @pytest.mark.asyncio
@@ -3167,7 +3156,7 @@ class TestCreateDocumentType:
             result = await paperless.create_document_type("Quittung")
 
         assert result == {"id": 11, "name": "Quittung"}
-        assert paperless._document_type_cache is None
+        assert paperless._document_type_cache == {1: "Rechnung", 11: "Quittung"}  # added, never flushed
 
     @pytest.mark.asyncio
     async def test_rejects_duplicate(self):
@@ -3217,7 +3206,7 @@ class TestCreateTag:
         # Verify color was sent in the payload.
         post_call = client.post.await_args
         assert post_call.kwargs["json"]["color"] == "#a6cee3"
-        assert paperless._tag_cache is None
+        assert paperless._tag_cache == {8: "steuer-2026"}  # added, never flushed
 
     @pytest.mark.asyncio
     async def test_creates_without_color_omits_field(self):
@@ -3286,7 +3275,7 @@ class TestCreateStoragePath:
 
         assert result["id"] == 2
         assert result["path"] == "/steuer/{created_year}"
-        assert paperless._storage_path_cache is None
+        assert paperless._storage_path_cache == {2: "/steuer/{created_year}"}  # keyed on the path
 
     @pytest.mark.asyncio
     async def test_rejects_empty_path(self):
@@ -4966,8 +4955,10 @@ class TestTaxonomyRefreshOnMiss:
 
     @pytest.mark.asyncio
     async def test_refresh_never_leaves_an_empty_window(self):
-        """While the reload is in flight a concurrent reader still sees the old
-        copy — never None/{} (it rendered documents without their tags)."""
+        """While a reload is in flight a concurrent reader still sees the old
+        copy: ``_refresh`` swaps in a complete dict, it never flushes first.
+        (The flush that DID open such a window was create_*'s invalidation —
+        covered by ``TestRememberCreated``.)"""
         _seed(tag={1: "privat"})
         gate = asyncio.Event()
         seen: list = []
@@ -5055,3 +5046,71 @@ class TestUnambiguousResolution:
         with patch("httpx.AsyncClient", return_value=client):
             result = await paperless.search_documents(tags=["gibt-es-nicht"])
         assert "gibt-es-nicht" in result["error"]
+
+
+class TestIdToNameFreshness:
+    """Review of #19: the reverse direction. A document carrying an id the cache
+    does not know was rendered WITHOUT it — a UI-set tag made it look untagged,
+    and a caller filling "missing" tags then PATCHed the UI tag away."""
+
+    @pytest.mark.asyncio
+    async def test_get_document_names_a_tag_created_elsewhere(self):
+        _seed(tag={1: "privat"})
+        client = _client_serving(tag={1: "privat", 2: "ui-tag"})
+        doc_resp = MagicMock(status_code=200)
+        doc_resp.raise_for_status = MagicMock()
+        doc_resp.json.return_value = {"id": 42, "title": "x", "tags": [1, 2]}
+        taxonomy_get = client.get.side_effect
+
+        async def _get(url, *a, **k):
+            if "/api/documents/42/" in url:
+                return doc_resp
+            return await taxonomy_get(url, *a, **k)
+
+        client.get = AsyncMock(side_effect=_get)
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.get_document(42)
+        assert result["tags"] == ["privat", "ui-tag"]
+
+    @pytest.mark.asyncio
+    async def test_known_ids_cost_no_refresh(self):
+        _seed(tag={1: "privat"}, correspondent={5: "Bank"})
+        client = _client_serving(tag={1: "privat"}, correspondent={5: "Bank"})
+        await paperless._ensure_ids_known(client, [{"tags": [1], "correspondent": 5}])
+        assert client.calls == {}
+
+    @pytest.mark.asyncio
+    async def test_each_stale_dimension_refreshes_once(self):
+        _seed(tag={1: "privat"}, correspondent={5: "Bank"})
+        client = _client_serving(tag={1: "a", 2: "b", 3: "c"}, correspondent={5: "Bank", 6: "Neu"})
+        docs = [{"tags": [2], "correspondent": 6}, {"tags": [3], "correspondent": 6}]
+        await paperless._ensure_ids_known(client, docs)
+        assert client.calls == {"tag": 1, "correspondent": 1}
+        assert paperless._correspondent_cache == {5: "Bank", 6: "Neu"}
+
+
+class TestAmbiguousNames:
+    """Review of #19: two candidates are not "unknown"."""
+
+    @pytest.mark.asyncio
+    async def test_search_names_the_candidates_and_does_not_refresh(self):
+        _seed(correspondent={1: "Telekom Deutschland GmbH", 2: "Telekom Mobilfunk"})
+        client = _client_serving(correspondent={1: "Telekom Deutschland GmbH", 2: "Telekom Mobilfunk"})
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.search_documents(correspondent="Telekom")
+        assert result["error"].startswith("Ambiguous correspondent: 'Telekom'")
+        assert "Telekom Mobilfunk" in result["error"]
+        assert "Unknown" not in result["error"]
+        assert client.calls == {}  # the entries are there — no reload
+
+    @pytest.mark.asyncio
+    async def test_create_correspondent_still_blocks_a_contained_name(self):
+        """Renfield's folder ingest relies on it: no third "Telekom"."""
+        _seed(correspondent={1: "Telekom Deutschland GmbH", 2: "Telekom Mobilfunk"})
+        client = _client_serving(correspondent={1: "Telekom Deutschland GmbH", 2: "Telekom Mobilfunk"})
+        client.post = AsyncMock()
+        with patch("httpx.AsyncClient", return_value=client):
+            result = await paperless.create_correspondent("Telekom")
+        assert result["error"] == "already_exists"
+        assert result["existing_id"] == 1
+        client.post.assert_not_called()

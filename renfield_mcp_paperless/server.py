@@ -104,7 +104,7 @@ def _get_cache(dimension: _CacheDimension) -> Optional[dict[int, str]]:
     }[dimension]
 
 
-async def _refresh(client: httpx.AsyncClient, dimension: _CacheDimension) -> None:
+async def _refresh(client: httpx.AsyncClient, dimension: _CacheDimension) -> dict[int, str]:
     """Load one dimension from Paperless and swap it in as a WHOLE.
 
     The old copy stays readable until the new one is complete: a concurrent
@@ -122,6 +122,7 @@ async def _refresh(client: httpx.AsyncClient, dimension: _CacheDimension) -> Non
         fresh = {it["id"]: it["name"] for it in items}
     _set_cache(dimension, fresh)
     logger.info("Cached %d %s", len(fresh), label)
+    return fresh
 
 
 async def _ensure_caches(client: httpx.AsyncClient) -> None:
@@ -138,61 +139,60 @@ async def _ensure_caches(client: httpx.AsyncClient) -> None:
         await asyncio.gather(*(_refresh(client, d) for d in missing))
 
 
-def _invalidate_cache(dimension: _CacheDimension) -> None:
-    """Flush one taxonomy cache so the next ``_ensure_caches`` reloads it.
+def _remember_created(dimension: _CacheDimension, id_: int, label: str) -> None:
+    """Add an entry this process just created — as a new dict swapped in whole.
 
-    Called by each ``create_*`` tool after a successful create, so the new
-    entry is visible to the next call in this process. Entries created
-    ELSEWHERE (the Paperless UI, another process running this server) are
-    picked up by ``_resolve`` on a miss and by the ``list_*`` tools, which
-    always read fresh.
+    Flushing the dimension instead (what create_* used to do) left it
+    ``None`` until the next load, and a concurrent call that had already passed
+    ``_ensure_caches`` rendered its documents without names in between. A cache
+    that was never loaded stays unloaded: the next ``_ensure_caches`` fetches it.
     """
-    _set_cache(dimension, None)
+    current = _get_cache(dimension)
+    if current is None:
+        return
+    _set_cache(dimension, {**current, id_: label})
 
 
 # --- Name → ID resolution helpers ---
 
 
-def _resolve_name_to_id(
-    name: str, cache: dict[int, str], *, substring: bool = True
-) -> int | None:
-    """Resolve a human-readable name to a cache ID.
+def _candidates(name: str, cache: dict[int, str], *, substring: bool = True) -> list[int]:
+    """All ids ``name`` could mean, most specific pass first.
 
-    Priority: exact match → case-insensitive → substring (bidirectional).
-
-    The substring pass is a convenience for organisation names ("Telekom" →
-    "Telekom Deutschland GmbH") and only answers when it is UNAMBIGUOUS:
-    exactly one entry contains, or is contained in, the name. Two or more
-    candidates → None, never the first one the dict happens to yield.
-
-    ``substring=False`` stops after the case-insensitive pass. Tags use it:
-    a tag is a short label, a substring hit ("Auto" → "Autoversicherung") is a
-    different tag, and filing under it is a silent wrong write.
+    Exact match → case-insensitive → substring (bidirectional). The first pass
+    with a hit decides; only the substring pass can return several ids.
+    ``substring=False`` stops after the case-insensitive pass (tags — a tag is
+    a short label, and "Auto" → "Autoversicherung" is a DIFFERENT tag).
     """
-    name_lower = name.lower()
-
-    # 1. Exact match
     for id_, cached_name in cache.items():
         if cached_name == name:
-            return id_
-
-    # 2. Case-insensitive
+            return [id_]
+    name_lower = name.lower()
     for id_, cached_name in cache.items():
         if cached_name.lower() == name_lower:
-            return id_
-
+            return [id_]
     if not substring or not name_lower:
-        return None
-
-    # 3. Substring (bidirectional): "Telekom" matches "Telekom Deutschland GmbH"
-    #    and "Telekom Deutschland GmbH" matches "Telekom" — only when unique.
-    candidates = [
+        return []
+    return [
         id_
         for id_, cached_name in cache.items()
         if cached_name
         and (name_lower in cached_name.lower() or cached_name.lower() in name_lower)
     ]
-    return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_name_to_id(
+    name: str, cache: dict[int, str], *, substring: bool = True
+) -> int | None:
+    """Resolve a human-readable name to a cache ID — only when UNAMBIGUOUS.
+
+    The substring pass is a convenience for organisation names ("Telekom" →
+    "Telekom Deutschland GmbH"); with two candidates it answers None rather
+    than the first one the dict happens to yield (``_ambiguity`` says so to the
+    caller — it is not "unknown").
+    """
+    found = _candidates(name, cache, substring=substring)
+    return found[0] if len(found) == 1 else None
 
 
 def _resolve_tags_to_ids(tag_names: list[str], cache: dict[int, str]) -> list[int]:
@@ -210,26 +210,63 @@ def _cache_of(dimension: _CacheDimension) -> dict[int, str]:
     return _get_cache(dimension) or {}
 
 
+def _ambiguity(dimension: _CacheDimension, name: str) -> str | None:
+    """The error text for an AMBIGUOUS name, or None if it is not ambiguous.
+
+    "Unknown correspondent: 'Telekom'" would be false when two Telekom entries
+    exist — the agent would tell the user there is no such sender, or create a
+    third one. Name the candidates instead, so the caller can pick.
+    """
+    cache = _cache_of(dimension)
+    found = _candidates(name, cache, substring=dimension != "tag")
+    if len(found) < 2:
+        return None
+    label = dimension.replace("_", " ")
+    shown = sorted(cache[i] for i in found)[:10]
+    return f"Ambiguous {label}: '{name}' matches {shown} — use the full name"
+
+
 async def _resolve(
     client: httpx.AsyncClient, dimension: _CacheDimension, name: str
 ) -> int | None:
     """Resolve ``name`` in one taxonomy dimension, refreshing that dimension
-    ONCE on a miss.
+    ONCE when nothing matches.
 
-    The caches live for the whole process and nothing else invalidates them
-    (only this process's own ``create_*``). An entry created in the Paperless
+    The caches live for the whole process. An entry created in the Paperless
     UI, or by another Renfield process (the document worker runs its own copy
     of this server), was therefore "unknown" until a restart — although it
     existed. A miss is the one moment the cache is provably suspect, so that is
-    when it reloads: no timer, no polling, and a hit costs nothing extra.
+    when it reloads: no timer, no polling, and a hit costs nothing extra. An
+    AMBIGUOUS name is not a miss (the entries are there) and does not reload.
     """
     await _ensure_caches(client)
     substring = dimension != "tag"
-    found = _resolve_name_to_id(name, _cache_of(dimension), substring=substring)
-    if found is not None:
-        return found
-    await _refresh(client, dimension)
-    return _resolve_name_to_id(name, _cache_of(dimension), substring=substring)
+    found = _candidates(name, _cache_of(dimension), substring=substring)
+    if not found:
+        await _refresh(client, dimension)
+        found = _candidates(name, _cache_of(dimension), substring=substring)
+    return found[0] if len(found) == 1 else None
+
+
+async def _existing_for_create(
+    client: httpx.AsyncClient, dimension: _CacheDimension, name: str
+) -> int | None:
+    """The duplicate pre-check of the ``create_*`` tools.
+
+    Deliberately WIDER than ``_resolve``: any candidate blocks a create, and the
+    first one is reported as ``already_exists`` — Renfield's folder ingest relies
+    on "a contained name is an existing entry" so it never mints a third
+    "Telekom" next to two "Telekom …" (``resolve_or_create_correspondent``).
+    Tags match exactly (case-insensitively) only, so "Auto" is creatable next to
+    "Autoversicherung". Refreshes once when nothing matches.
+    """
+    await _ensure_caches(client)
+    substring = dimension != "tag"
+    found = _candidates(name, _cache_of(dimension), substring=substring)
+    if not found:
+        await _refresh(client, dimension)
+        found = _candidates(name, _cache_of(dimension), substring=substring)
+    return found[0] if found else None
 
 
 async def _resolve_tags(
@@ -252,6 +289,36 @@ async def _resolve_tags(
         else:
             ids.append(id_)
     return ids, unresolved
+
+
+_ID_FIELDS: tuple[tuple[str, _CacheDimension], ...] = (
+    ("correspondent", "correspondent"),
+    ("document_type", "document_type"),
+    ("storage_path", "storage_path"),
+)
+
+
+async def _ensure_ids_known(client: httpx.AsyncClient, docs: list[dict]) -> None:
+    """id → name: refresh every dimension in which ``docs`` carry an id the cache
+    does not know — once per dimension, before the documents are rendered.
+
+    The renderers drop an unknown id silently. A tag set in the Paperless UI
+    then made a document look UNTAGGED, and a caller that "fills missing tags"
+    PATCHed the list and so REMOVED the UI tag (Paperless replaces the list).
+    Same rule as name → id: a miss is the moment to reload.
+    """
+    await _ensure_caches(client)
+    stale: set[_CacheDimension] = set()
+    tags = _cache_of("tag")
+    for doc in docs:
+        if any(t not in tags for t in (doc.get("tags") or [])):
+            stale.add("tag")
+        for field, dim in _ID_FIELDS:
+            value = doc.get(field)
+            if value and value not in _cache_of(dim):
+                stale.add(dim)
+    if stale:
+        await asyncio.gather(*(_refresh(client, d) for d in sorted(stale)))
 
 
 # --- Auto-pagination helper ---
@@ -431,7 +498,7 @@ def _resolve_document(doc: dict, query: str | None = None) -> dict:
         # metadata match) straight from search, without a per-document get_document.
         "page_count": doc.get("page_count"),
         "snippet": snippet,
-        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
+        "storage_path": (_storage_path_cache or {}).get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
 
     return result
@@ -519,14 +586,14 @@ async def search_documents(
         if document_type:
             dt_id = await _resolve(client, "document_type", document_type)
             if dt_id is None:
-                return {"error": f"Unknown document type: '{document_type}'"}
+                return {"error": _ambiguity("document_type", document_type) or f"Unknown document type: '{document_type}'"}
             params["document_type__id"] = dt_id
             filters_applied["document_type"] = document_type
 
         if correspondent:
             corr_id = await _resolve(client, "correspondent", correspondent)
             if corr_id is None:
-                return {"error": f"Unknown correspondent: '{correspondent}'"}
+                return {"error": _ambiguity("correspondent", correspondent) or f"Unknown correspondent: '{correspondent}'"}
             params["correspondent__id"] = corr_id
             filters_applied["correspondent"] = correspondent
 
@@ -542,7 +609,7 @@ async def search_documents(
         if storage_path:
             sp_id = await _resolve(client, "storage_path", storage_path)
             if sp_id is None:
-                return {"error": f"Unknown storage path: '{storage_path}'"}
+                return {"error": _ambiguity("storage_path", storage_path) or f"Unknown storage path: '{storage_path}'"}
             params["storage_path__id"] = sp_id
             filters_applied["storage_path"] = storage_path
 
@@ -552,6 +619,7 @@ async def search_documents(
             filters_applied["created_before"] = created_before
 
         raw_results, total_count = await _fetch_documents(client, params, max_results)
+        await _ensure_ids_known(client, raw_results)
 
     results = [_resolve_document(doc, query) for doc in raw_results]
     summary = _build_summary(results, total_count, max_results, filters_applied)
@@ -604,6 +672,7 @@ async def list_all_documents(include_checksum: bool = True) -> dict:
         raw_results, total_count = await _fetch_documents(
             client, params, _FULL_LIST_CEILING
         )
+        await _ensure_ids_known(client, raw_results)
 
     results = [_resolve_list_document(doc) for doc in raw_results]
     return {
@@ -1057,7 +1126,7 @@ async def upload_document(
             cid = await _resolve(client, "correspondent", correspondent)
             if cid is None:
                 return {
-                    "error": (
+                    "error": _ambiguity("correspondent", correspondent) or (
                         f"Unknown correspondent: {correspondent!r}. Create it "
                         "first via create_correspondent, or omit the field."
                     ),
@@ -1067,7 +1136,7 @@ async def upload_document(
             dtid = await _resolve(client, "document_type", document_type)
             if dtid is None:
                 return {
-                    "error": (
+                    "error": _ambiguity("document_type", document_type) or (
                         f"Unknown document_type: {document_type!r}. Create it "
                         "first via create_document_type, or omit the field."
                     ),
@@ -1141,7 +1210,9 @@ async def upload_document(
             sp_id = await _resolve(client, "storage_path", storage_path)
             if sp_id is None:
                 result["post_upload_patch"] = "unknown_storage_path"
-                result["patch_error"] = f"Unknown storage path: {storage_path!r}"
+                result["patch_error"] = _ambiguity("storage_path", storage_path) or (
+                    f"Unknown storage path: {storage_path!r}"
+                )
                 return result
             patch_data["storage_path"] = sp_id
         if created_date is not None:
@@ -1258,8 +1329,8 @@ async def get_document(document_id: int, include_content: bool = True) -> dict:
         if resp.status_code == 404:
             return {"error": f"Document {document_id} not found"}
         resp.raise_for_status()
-
-    doc = resp.json()
+        doc = resp.json()
+        await _ensure_ids_known(client, [doc])
 
     corr_id = doc.get("correspondent")
     dtype_id = doc.get("document_type")
@@ -1278,7 +1349,7 @@ async def get_document(document_id: int, include_content: bool = True) -> dict:
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
         "original_file_name": doc.get("original_file_name"),
-        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
+        "storage_path": (_storage_path_cache or {}).get(doc.get("storage_path")) if doc.get("storage_path") else None,
         "custom_fields": doc.get("custom_fields"),   # [{field: id, value: ...}]
         "page_count": doc.get("page_count"),
         "added": doc.get("added"),
@@ -1332,13 +1403,13 @@ async def update_document(
         if correspondent is not None:
             corr_id = await _resolve(client, "correspondent", correspondent)
             if corr_id is None:
-                return {"error": f"Unknown correspondent: '{correspondent}'"}
+                return {"error": _ambiguity("correspondent", correspondent) or f"Unknown correspondent: '{correspondent}'"}
             patch_data["correspondent"] = corr_id
 
         if document_type is not None:
             dt_id = await _resolve(client, "document_type", document_type)
             if dt_id is None:
-                return {"error": f"Unknown document type: '{document_type}'"}
+                return {"error": _ambiguity("document_type", document_type) or f"Unknown document type: '{document_type}'"}
             patch_data["document_type"] = dt_id
 
         if tags is not None:
@@ -1353,7 +1424,7 @@ async def update_document(
         if storage_path is not None:
             sp_id = await _resolve(client, "storage_path", storage_path)
             if sp_id is None:
-                return {"error": f"Unknown storage path: '{storage_path}'"}
+                return {"error": _ambiguity("storage_path", storage_path) or f"Unknown storage path: '{storage_path}'"}
             patch_data["storage_path"] = sp_id
 
         if custom_fields is not None:
@@ -1373,8 +1444,8 @@ async def update_document(
         if resp.status_code == 404:
             return {"error": f"Document {document_id} not found"}
         resp.raise_for_status()
-
-    doc = resp.json()
+        doc = resp.json()
+        await _ensure_ids_known(client, [doc])
 
     corr_id = doc.get("correspondent")
     dtype_id = doc.get("document_type")
@@ -1390,7 +1461,7 @@ async def update_document(
         "correspondent": (_correspondent_cache or {}).get(corr_id) if corr_id else None,
         "document_type": (_document_type_cache or {}).get(dtype_id) if dtype_id else None,
         "tags": resolved_tags if resolved_tags else None,
-        "storage_path": _storage_path_cache.get(doc.get("storage_path")) if doc.get("storage_path") else None,
+        "storage_path": (_storage_path_cache or {}).get(doc.get("storage_path")) if doc.get("storage_path") else None,
     }
 
 
@@ -2270,8 +2341,8 @@ async def list_storage_paths() -> dict:
         return {"error": "PAPERLESS_API_URL and PAPERLESS_API_TOKEN must be set"}
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        await _refresh(client, "storage_path")  # fresh, like the other listings
-    paths = [{"id": pid, "path": pname} for pid, pname in (_storage_path_cache or {}).items()]
+        fresh = await _refresh(client, "storage_path")  # fresh, like the other listings
+    paths = [{"id": pid, "path": pname} for pid, pname in fresh.items()]
     return {"paths": paths}
 
 
@@ -2300,11 +2371,8 @@ async def list_correspondents() -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         # A listing is the taxonomy as Paperless has it NOW — never the copy
         # this process loaded at start (entries created elsewhere were missing).
-        await _refresh(client, "correspondent")
-    items = [
-        {"id": cid, "name": cname}
-        for cid, cname in (_correspondent_cache or {}).items()
-    ]
+        fresh = await _refresh(client, "correspondent")
+    items = [{"id": cid, "name": cname} for cid, cname in fresh.items()]
     return {"items": items}
 
 
@@ -2322,11 +2390,8 @@ async def list_document_types() -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         # A listing is the taxonomy as Paperless has it NOW — never the copy
         # this process loaded at start (entries created elsewhere were missing).
-        await _refresh(client, "document_type")
-    items = [
-        {"id": did, "name": dname}
-        for did, dname in (_document_type_cache or {}).items()
-    ]
+        fresh = await _refresh(client, "document_type")
+    items = [{"id": did, "name": dname} for did, dname in fresh.items()]
     return {"items": items}
 
 
@@ -2344,11 +2409,8 @@ async def list_tags() -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         # A listing is the taxonomy as Paperless has it NOW — never the copy
         # this process loaded at start (entries created elsewhere were missing).
-        await _refresh(client, "tag")
-    items = [
-        {"id": tid, "name": tname}
-        for tid, tname in (_tag_cache or {}).items()
-    ]
+        fresh = await _refresh(client, "tag")
+    items = [{"id": tid, "name": tname} for tid, tname in fresh.items()]
     return {"items": items}
 
 
@@ -2392,7 +2454,7 @@ async def create_correspondent(name: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         await _ensure_caches(client)
 
-        existing_id = await _resolve(client, "correspondent", name)
+        existing_id = await _existing_for_create(client, "correspondent", name)
         if existing_id is not None:
             return {
                 "error": "already_exists",
@@ -2412,7 +2474,7 @@ async def create_correspondent(name: str) -> dict:
         resp.raise_for_status()
 
     created = resp.json()
-    _invalidate_cache("correspondent")
+    _remember_created("correspondent", created["id"], created["name"])
     return {"id": created["id"], "name": created["name"]}
 
 
@@ -2435,7 +2497,7 @@ async def create_document_type(name: str) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         await _ensure_caches(client)
 
-        existing_id = await _resolve(client, "document_type", name)
+        existing_id = await _existing_for_create(client, "document_type", name)
         if existing_id is not None:
             return {
                 "error": "already_exists",
@@ -2453,7 +2515,7 @@ async def create_document_type(name: str) -> dict:
         resp.raise_for_status()
 
     created = resp.json()
-    _invalidate_cache("document_type")
+    _remember_created("document_type", created["id"], created["name"])
     return {"id": created["id"], "name": created["name"]}
 
 
@@ -2478,7 +2540,7 @@ async def create_tag(name: str, color: str | None = None) -> dict:
     async with httpx.AsyncClient(timeout=30.0) as client:
         await _ensure_caches(client)
 
-        existing_id = await _resolve(client, "tag", name)
+        existing_id = await _existing_for_create(client, "tag", name)
         if existing_id is not None:
             return {
                 "error": "already_exists",
@@ -2500,7 +2562,7 @@ async def create_tag(name: str, color: str | None = None) -> dict:
         resp.raise_for_status()
 
     created = resp.json()
-    _invalidate_cache("tag")
+    _remember_created("tag", created["id"], created["name"])
     return {
         "id": created["id"],
         "name": created["name"],
@@ -2539,9 +2601,9 @@ async def create_storage_path(name: str, path: str) -> dict:
         # Storage-path cache values are the path strings themselves (see
         # _ensure_caches). We resolve against both the name and the path
         # to avoid creating a second entry that duplicates a path.
-        existing_id = await _resolve(client, "storage_path", name)
+        existing_id = await _existing_for_create(client, "storage_path", name)
         if existing_id is None:
-            existing_id = await _resolve(client, "storage_path", path)
+            existing_id = await _existing_for_create(client, "storage_path", path)
         if existing_id is not None:
             return {
                 "error": "already_exists",
@@ -2559,7 +2621,10 @@ async def create_storage_path(name: str, path: str) -> dict:
         resp.raise_for_status()
 
     created = resp.json()
-    _invalidate_cache("storage_path")
+    # the storage-path cache is keyed on the path string (see _refresh)
+    _remember_created(
+        "storage_path", created["id"], created.get("path") or created.get("name", "")
+    )
     return {
         "id": created["id"],
         "name": created["name"],
